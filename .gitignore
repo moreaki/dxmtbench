@@ -1,0 +1,10 @@
+/.DS_Store
+/dxmtbench-runs/
+/vbox-webgl-benchmark-runs/
+/*.log
+/*.sample.txt
+/*.png
+/*.ips
+/.venv/
+/__pycache__/
+*.pyc
