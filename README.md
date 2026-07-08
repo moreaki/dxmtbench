@@ -99,6 +99,11 @@ The Python server runs on the host. It serves the benchmark page and receives:
 - `POST /event` for intermediate state changes and progress notifications;
 - `POST /result` for the final benchmark result.
 
+For VM runs, the runner writes the full browser configuration to `bench-config.json`
+and the server injects it into the served HTML. The URL typed into the guest stays
+short on purpose; long query strings were observed to be truncated by VirtualBox
+keyboard injection before the final parameters reached the browser.
+
 The VM normally reaches the host through VirtualBox NAT at `10.0.2.2`. Local browser
 runs use `127.0.0.1`. Both modes use the same server and the same browser-side result
 format.
@@ -222,7 +227,8 @@ Common controls:
 - `MIDRUN_SCREENSHOT`: defaults to `1`; captures a screenshot during the measurement
   window as `measure-mid.png`.
 - `MIDRUN_SCREENSHOT_DELAY`: optional delay in seconds before `measure-mid.png`. The
-  default is half of `DURATION`.
+  default is one second after the browser posts `measure-start`, which avoids mistaking
+  post-run WebGL context release for a rendering failure.
 - `VISUAL_ANALYSIS`: defaults to `1`; classifies screenshots as blank black, blank
   white, blank gray, low contrast, or varied output.
 
@@ -279,6 +285,9 @@ Each run writes a timestamped directory under `dxmtbench-runs`.
 Important files:
 
 - `run-config.txt`: effective runner configuration.
+- `bench-config.json`: browser-side benchmark configuration injected by the host
+  server. The page also reports `configSource`, `rawQuery`, and injected config keys
+  in browser events so stale navigation or URL truncation is visible.
 - `host-info.txt`: host and VirtualBox version context.
 - `browser-events.jsonl`: progress, warnings, and lifecycle events posted by the page.
 - `browser-result.json`: final browser-side benchmark result.

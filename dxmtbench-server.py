@@ -6,6 +6,7 @@ import pathlib
 import socketserver
 import sys
 import time
+import urllib.parse
 
 
 class BenchmarkHandler(http.server.SimpleHTTPRequestHandler):
@@ -26,9 +27,34 @@ class BenchmarkHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path == "/" or self.path.startswith("/bench"):
-            self.path = "/" + self.server.benchmark_html.name
+        request_path = urllib.parse.urlsplit(self.path).path
+        if request_path == "/" or request_path.startswith("/bench"):
+            self.serve_benchmark_html()
+            return
         return super().do_GET()
+
+    def serve_benchmark_html(self):
+        config = {}
+        if self.server.config_file and self.server.config_file.exists():
+            try:
+                config = json.loads(self.server.config_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                self.send_error(500, "invalid benchmark config: %s" % exc)
+                return
+
+        html = self.server.benchmark_html.read_text(encoding="utf-8")
+        injection = "<script>window.DXMTBENCH_CONFIG = %s;</script>\n" % json.dumps(config, separators=(",", ":"))
+        marker = '<script>\n"use strict";'
+        if marker in html:
+            html = html.replace(marker, injection + marker, 1)
+        else:
+            html = injection + html
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         try:
@@ -73,6 +99,7 @@ def main():
     parser.add_argument("--root", required=True)
     parser.add_argument("--html", required=True)
     parser.add_argument("--outdir", required=True)
+    parser.add_argument("--config")
     args = parser.parse_args()
 
     root = pathlib.Path(args.root).resolve()
@@ -85,6 +112,7 @@ def main():
     handler = lambda *handler_args, **handler_kwargs: BenchmarkHandler(*handler_args, directory=str(root), **handler_kwargs)
     with ThreadedTCPServer((args.bind, args.port), handler) as server:
         server.benchmark_html = html
+        server.config_file = pathlib.Path(args.config).resolve() if args.config else None
         server.events_file = outdir / "browser-events.jsonl"
         server.result_file = outdir / "browser-result.json"
         server.log_file = outdir / "http-server.log"

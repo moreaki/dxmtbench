@@ -865,7 +865,45 @@ if [[ "$target" == "vm" ]]; then
     vm_3d="$(printf '%s\n' "$vm_info_mr" | awk -F= '$1=="accelerate3d"{gsub(/"/,"",$2); print $2; exit}')"
     capture_graphics_log_start
 fi
-url="http://${url_host}:${port}/bench.html?run=${run_id}&target=${target}&duration=$((duration * 1000))&warmup=$((warmup * 1000))&instances=${instances}&dpr=${dpr}&workload=${workload}&shaderIters=${shader_iters}&textureSize=${texture_size}&vertices=${vertices}&dynamicVertices=${dynamic_vertices}&offscreenScale=${offscreen_scale}&passes=${passes}&mode=${mode}&chunkMs=${chunk_ms}&finish=${finish_each_frame}&syncEvery=${sync_every}&maxCanvasPixels=${max_canvas_pixels}&releaseContext=${release_context}&hostCpus=${host_cpus}&hostMemoryMb=${host_memory_mb}&localBrowser=${local_browser}&vmCpus=${vm_cpus}&vmMemoryMb=${vm_memory_mb}&vmVramMb=${vm_vram_mb}&vmGraphics=${vm_graphics}&vm3d=${vm_3d}"
+bench_config_file="$outdir/bench-config.json"
+python3 - "$bench_config_file" \
+    run "$run_id" \
+    target "$target" \
+    duration "$((duration * 1000))" \
+    warmup "$((warmup * 1000))" \
+    instances "$instances" \
+    dpr "$dpr" \
+    workload "$workload" \
+    shaderIters "$shader_iters" \
+    textureSize "$texture_size" \
+    vertices "$vertices" \
+    dynamicVertices "$dynamic_vertices" \
+    offscreenScale "$offscreen_scale" \
+    passes "$passes" \
+    mode "$mode" \
+    chunkMs "$chunk_ms" \
+    finish "$finish_each_frame" \
+    syncEvery "$sync_every" \
+    maxCanvasPixels "$max_canvas_pixels" \
+    releaseContext "$release_context" \
+    hostCpus "$host_cpus" \
+    hostMemoryMb "$host_memory_mb" \
+    localBrowser "$local_browser" \
+    vmCpus "$vm_cpus" \
+    vmMemoryMb "$vm_memory_mb" \
+    vmVramMb "$vm_vram_mb" \
+    vmGraphics "$vm_graphics" \
+    vm3d "$vm_3d" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+pairs = sys.argv[2:]
+config = {pairs[i]: pairs[i + 1] for i in range(0, len(pairs), 2)}
+path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
 
 {
     printf 'target=%s\n' "$target"
@@ -874,6 +912,7 @@ url="http://${url_host}:${port}/bench.html?run=${run_id}&target=${target}&durati
     printf 'server_bind=%s\n' "$server_bind"
     printf 'url_host=%s\n' "$url_host"
     printf 'url=%s\n' "$url"
+    printf 'bench_config_file=%s\n' "$bench_config_file"
     printf 'duration=%ss\n' "$duration"
     printf 'warmup=%ss\n' "$warmup"
     printf 'instances=%s\n' "$instances"
@@ -1174,7 +1213,7 @@ if [[ "$target" == "vm" ]]; then
         | tee "$outdir/vminfo-before.txt"
 fi
 
-python3 "$server_py" --bind "$server_bind" --port "$port" --root "$script_dir" --html "$html" --outdir "$outdir" >"$outdir/server.stdout" 2>"$outdir/server.stderr" &
+python3 "$server_py" --bind "$server_bind" --port "$port" --root "$script_dir" --html "$html" --outdir "$outdir" --config "$bench_config_file" >"$outdir/server.stdout" 2>"$outdir/server.stderr" &
 server_pid=$!
 cleanup() {
     kill "$server_pid" >/dev/null 2>&1 || true
@@ -1227,8 +1266,7 @@ fi
 midrun_screenshot_pid=""
 if [[ "$midrun_screenshot" == "1" ]]; then
     if [[ -z "$midrun_screenshot_delay" ]]; then
-        midrun_screenshot_delay=$((duration / 2))
-        ((midrun_screenshot_delay < 1)) && midrun_screenshot_delay=1
+        midrun_screenshot_delay=1
     fi
     (
         sleep "$midrun_screenshot_delay"

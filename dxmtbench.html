@@ -70,39 +70,52 @@ canvas {
 "use strict";
 
 const params = new URLSearchParams(location.search);
-const durationMs = Math.max(1000, Number(params.get("duration") || 45000));
-const warmupMs = Math.max(0, Number(params.get("warmup") || 5000));
-const instances = Math.max(1, Number(params.get("instances") || 512));
-const requestedDpr = params.get("dpr") || "auto";
-const workloadName = params.get("workload") || "cubes-fill";
+const serverConfig = window.DXMTBENCH_CONFIG || {};
+const serverConfigKeys = Object.keys(serverConfig).sort();
+const configSource = serverConfigKeys.length ? "server" : "query";
+
+function readParam(name, fallback) {
+    const queryValue = params.get(name);
+    if (queryValue !== null)
+        return queryValue;
+    if (Object.prototype.hasOwnProperty.call(serverConfig, name))
+        return String(serverConfig[name]);
+    return fallback;
+}
+
+const durationMs = Math.max(1000, Number(readParam("duration", "45000")));
+const warmupMs = Math.max(0, Number(readParam("warmup", "5000")));
+const instances = Math.max(1, Number(readParam("instances", "512")));
+const requestedDpr = readParam("dpr", "auto");
+const workloadName = readParam("workload", "cubes-fill");
 const workloadNeedsStencil = workloadName.includes("stencil");
-const runId = params.get("run") || new Date().toISOString();
-const shaderIters = Math.max(1, Number(params.get("shaderIters") || 64));
-const textureSize = Math.max(16, Number(params.get("textureSize") || 1024));
-const vertexCount = Math.max(256, Number(params.get("vertices") || Math.max(65536, instances * 128)));
-const dynamicVertices = Math.max(256, Number(params.get("dynamicVertices") || Math.min(vertexCount, 131072)));
-const offscreenScale = Math.min(1.5, Math.max(0.1, Number(params.get("offscreenScale") || 0.75)));
-const passesPerFrame = Math.max(1, Number(params.get("passes") || 1));
-const requestedSchedulerMode = (params.get("mode") || "raf").toLowerCase();
+const runId = readParam("run", new Date().toISOString());
+const shaderIters = Math.max(1, Number(readParam("shaderIters", "64")));
+const textureSize = Math.max(16, Number(readParam("textureSize", "1024")));
+const vertexCount = Math.max(256, Number(readParam("vertices", String(Math.max(65536, instances * 128)))));
+const dynamicVertices = Math.max(256, Number(readParam("dynamicVertices", String(Math.min(vertexCount, 131072)))));
+const offscreenScale = Math.min(1.5, Math.max(0.1, Number(readParam("offscreenScale", "0.75"))));
+const passesPerFrame = Math.max(1, Number(readParam("passes", "1")));
+const requestedSchedulerMode = readParam("mode", "raf").toLowerCase();
 const schedulerMode = requestedSchedulerMode === "burst" ? "burst" : "raf";
-const burstChunkMs = Math.min(250, Math.max(1, Number(params.get("chunkMs") || 25)));
-const finishEachFrame = params.get("finish") === "1";
-const syncEvery = Math.max(0, Math.floor(Number(params.get("syncEvery") || 0)));
-const maxCanvasPixels = Math.max(0, Math.floor(Number(params.get("maxCanvasPixels") || 0)));
-const releaseContextAfterRun = params.get("releaseContext") !== "0";
-const runTarget = params.get("target") || "vm";
+const burstChunkMs = Math.min(250, Math.max(1, Number(readParam("chunkMs", "25"))));
+const finishEachFrame = readParam("finish", "0") === "1";
+const syncEvery = Math.max(0, Math.floor(Number(readParam("syncEvery", "0"))));
+const maxCanvasPixels = Math.max(0, Math.floor(Number(readParam("maxCanvasPixels", "0"))));
+const releaseContextAfterRun = readParam("releaseContext", "1") !== "0";
+const runTarget = readParam("target", "vm");
 const hostInfo = {
-    cpus: params.get("hostCpus") || "",
-    memoryMb: params.get("hostMemoryMb") || "",
-    localBrowser: params.get("localBrowser") || ""
+    cpus: readParam("hostCpus", ""),
+    memoryMb: readParam("hostMemoryMb", ""),
+    localBrowser: readParam("localBrowser", "")
 };
 const vmInfo = {
-    cpus: params.get("vmCpus") || "",
-    memoryMb: params.get("vmMemoryMb") || "",
-    vramMb: params.get("vmVramMb") || "",
-    graphics: params.get("vmGraphics") || "",
-    accelerate3d: params.get("vm3d") || "",
-    videoMode: params.get("vmVideoMode") || ""
+    cpus: readParam("vmCpus", ""),
+    memoryMb: readParam("vmMemoryMb", ""),
+    vramMb: readParam("vmVramMb", ""),
+    graphics: readParam("vmGraphics", ""),
+    accelerate3d: readParam("vm3d", ""),
+    videoMode: readParam("vmVideoMode", "")
 };
 const canvas = document.getElementById("gl");
 const metrics = document.getElementById("metrics");
@@ -136,6 +149,9 @@ const config = {
     maxCanvasPixels,
     releaseContextAfterRun,
     runTarget,
+    configSource,
+    rawQuery: location.search,
+    serverConfigKeys,
     hostInfo,
     vmInfo
 };
