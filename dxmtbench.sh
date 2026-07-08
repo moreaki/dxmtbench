@@ -415,6 +415,41 @@ alerts = []
 if status != "ok":
     alerts.append({"kind": "status", "message": status})
 
+def load_visual_primary(path):
+    summary = pathlib.Path(path) / "visual-summary.txt"
+    if not summary.exists():
+        return {}
+    values = {}
+    for line in summary.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.startswith("visual_primary_") or "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        name = key.removeprefix("visual_primary_")
+        parts = raw.split()
+        if not parts:
+            continue
+        item = {"classification": parts[0], "raw": raw}
+        for part in parts[1:]:
+            if "=" not in part:
+                continue
+            pkey, pvalue = part.split("=", 1)
+            item[pkey] = pvalue
+        values[name] = item
+    return values
+
+visual_primary = load_visual_primary(outdir)
+visual_mid = visual_primary.get("measure_mid", {})
+visual_mid_class = visual_mid.get("classification")
+visual_mid_source = visual_mid.get("source")
+if visual_mid_class and visual_mid_class != "visible-varied":
+    alerts.append({
+        "kind": "visual-primary",
+        "metric": "measure-mid",
+        "actual": visual_mid_class,
+        "source": visual_mid_source,
+        "message": "primary mid-run screenshot did not show varied graphical output",
+    })
+
 baseline = load_baseline(baseline_path_s).get(workload)
 if baseline:
     base_fps = baseline.get("fpsAvg")
@@ -467,6 +502,8 @@ metrics = {
     "renderTargetMiBPerSecond": parse_float(throughput.get("renderTargetMiBPerSecond")),
     "stencilMiBPerSecond": parse_float(throughput.get("stencilMiBPerSecond")),
     "uploadMiBPerSecond": parse_float(throughput.get("uploadMiBPerSecond")),
+    "visualPrimaryMeasureMid": visual_mid_class,
+    "visualPrimaryMeasureMidSource": visual_mid_source,
 }
 event = {
     "event": "suite-workload-result",
@@ -585,6 +622,35 @@ pid_for_vm() {
     pgrep -nf '/VirtualBoxVM.app/.*/VirtualBoxVM .*--startvm' || true
 }
 
+browser_window_id() {
+    [[ "$target" == "local" ]] || return 1
+    swift - "$local_browser_app" <<'SWIFT' 2>/dev/null || true
+import CoreGraphics
+import Foundation
+
+let appName = CommandLine.arguments.dropFirst().first ?? "Google Chrome"
+let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+let candidates = windows.compactMap { window -> (Int, Int, CGFloat)? in
+    let owner = window[kCGWindowOwnerName as String] as? String ?? ""
+    guard owner == appName || owner.contains(appName) else { return nil }
+    let title = window[kCGWindowName as String] as? String ?? ""
+    guard title.contains("DXMTBench") || title.contains("127.0.0.1") || title.contains("localhost") else { return nil }
+    guard let number = window[kCGWindowNumber as String] as? Int else { return nil }
+    let layer = window[kCGWindowLayer as String] as? Int ?? 0
+    let bounds = window[kCGWindowBounds as String] as? [String: Any] ?? [:]
+    let width = bounds["Width"] as? CGFloat ?? 0
+    let height = bounds["Height"] as? CGFloat ?? 0
+    return (number, layer, width * height)
+}
+if let best = candidates.sorted(by: { lhs, rhs in
+    if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
+    return lhs.2 > rhs.2
+}).first {
+    print(best.0)
+}
+SWIFT
+}
+
 vm_window_id() {
     [[ "$target" == "vm" ]] || return 1
     swift - "$vm" <<'SWIFT' 2>/dev/null || true
@@ -700,11 +766,22 @@ open_url_in_local_browser() {
     printf 'local_browser_process_pattern=%s\n' "$local_browser_process_pattern" | tee -a "$outdir/run-config.txt"
     before_pids="$(pgrep -f "$local_browser_process_pattern" 2>/dev/null | sort -n | paste -sd, - || true)"
     if [[ "$local_browser" == "chrome" ]]; then
-        if [[ -n "$local_browser_args" ]]; then
-            open -a "$local_browser_app" --args $local_browser_args "$url" >"$outdir/local-browser.stdout" 2>"$outdir/local-browser.stderr"
-        else
-            open -a "$local_browser_app" "$url" >"$outdir/local-browser.stdout" 2>"$outdir/local-browser.stderr"
-        fi
+        URL="$url" APP_NAME="$local_browser_app" WIDTH="$local_browser_width" HEIGHT="$local_browser_height" \
+            osascript <<'OSA' >"$outdir/local-browser.stdout" 2>"$outdir/local-browser.stderr" || \
+            open -a "$local_browser_app" "$url" >>"$outdir/local-browser.stdout" 2>>"$outdir/local-browser.stderr"
+set benchUrl to system attribute "URL"
+set appName to system attribute "APP_NAME"
+set winWidth to (system attribute "WIDTH") as integer
+set winHeight to (system attribute "HEIGHT") as integer
+tell application appName
+    activate
+    if (count of windows) = 0 then
+        make new window
+    end if
+    set bounds of front window to {80, 80, 80 + winWidth, 80 + winHeight}
+    set URL of active tab of front window to benchUrl
+end tell
+OSA
     elif [[ -x "$local_browser" ]]; then
         "$local_browser" ${local_browser_args:+$local_browser_args} "$url" >"$outdir/local-browser.stdout" 2>"$outdir/local-browser.stderr" &
         local_browser_pid=$!
@@ -1080,7 +1157,13 @@ capture_run_screenshot() {
             "$vboxmanage" controlvm "$vm" screenshotpng "$path" >/dev/null 2>&1 || true
         fi
     else
-        screencapture -x "$path" >/dev/null 2>&1 || true
+        local window_id
+        window_id="$(browser_window_id | head -n 1)"
+        if [[ -n "$window_id" ]]; then
+            screencapture -x -l "$window_id" "$path" >/dev/null 2>&1 || true
+        else
+            screencapture -x "$path" >/dev/null 2>&1 || true
+        fi
     fi
 }
 
@@ -1099,13 +1182,14 @@ capture_host_window_screenshot() {
 analyze_visuals() {
     [[ "$visual_analysis" == "1" ]] || return 0
 
-    if ! python3 - "$outdir" <<'PY'
+    if ! python3 - "$outdir" "$target" <<'PY'
 import json
 import math
 import pathlib
 import sys
 
 outdir = pathlib.Path(sys.argv[1])
+target = sys.argv[2] if len(sys.argv) > 2 else "vm"
 summary_txt = outdir / "visual-summary.txt"
 summary_json = outdir / "visual-summary.json"
 
@@ -1122,13 +1206,15 @@ def luma(rgb):
 def classify(mean_luma, std_luma, white_ratio, black_ratio, gray_ratio):
     if white_ratio >= 0.90:
         return "blank-white"
-    if black_ratio >= 0.90:
+    if black_ratio >= 0.90 and std_luma < 8:
         return "blank-black"
     if gray_ratio >= 0.90 and std_luma < 14:
         return "blank-gray"
     if white_ratio >= 0.72:
         return "mostly-white"
     if black_ratio >= 0.72:
+        if std_luma >= 10:
+            return "visible-varied"
         return "mostly-black"
     if gray_ratio >= 0.72 and std_luma < 22:
         return "mostly-gray"
@@ -1220,10 +1306,12 @@ if not entries:
     raise SystemExit(0)
 
 lines = ["visual_analysis=ok"]
+by_file = {}
 for entry in entries:
     if "error" in entry:
         lines.append(f"visual_{entry['file']}=error reason={entry['error']}")
         continue
+    by_file[entry["file"]] = entry
     key = entry["file"].removesuffix(".png").replace("-", "_")
     content = entry["content"]
     full = entry["full"]
@@ -1239,8 +1327,36 @@ for entry in entries:
         )
     )
 
+primary = {}
+for stage in ("before", "measure-mid", "after", "no-measure-start"):
+    candidates = [f"{stage}.png"]
+    if target == "vm":
+        candidates = [f"host-{stage}.png", f"{stage}.png"]
+    for name in candidates:
+        entry = by_file.get(name)
+        if not entry:
+            continue
+        key = stage.replace("-", "_")
+        content = entry["content"]
+        primary[key] = {
+            "source": name,
+            "classification": content["classification"],
+            "meanLuma": content["mean_luma"],
+            "stddevLuma": content["stddev_luma"],
+        }
+        lines.append(
+            "visual_primary_%s=%s source=%s content_luma=%.2f content_std=%.2f" % (
+                key,
+                content["classification"],
+                name,
+                content["mean_luma"],
+                content["stddev_luma"],
+            )
+        )
+        break
+
 summary_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
-summary_json.write_text(json.dumps({"available": True, "screenshots": entries}, indent=2) + "\n", encoding="utf-8")
+summary_json.write_text(json.dumps({"available": True, "target": target, "primary": primary, "screenshots": entries}, indent=2) + "\n", encoding="utf-8")
 PY
     then
         printf 'visual_analysis=failed\n' > "$outdir/visual-summary.txt"
@@ -1278,8 +1394,8 @@ if [[ "$target" == "vm" ]]; then
     capture_host_window_screenshot "$outdir/host-before.png"
     open_url_in_guest "$url"
 else
-    screencapture -x "$outdir/before.png" >/dev/null 2>&1 || true
     open_url_in_local_browser "$url"
+    capture_run_screenshot "$outdir/before.png"
     pid="$(cat "$outdir/local-browser.pid" 2>/dev/null || true)"
     printf 'pid=%s\n' "$pid" | tee -a "$outdir/run-config.txt"
 fi
@@ -1370,7 +1486,7 @@ if [[ "$target" == "vm" ]]; then
         | rg '^(VMState|VideoMode|accelerate3d|vram|graphicscontroller|clipboard|GuestAdditionsRunLevel)=' \
         | tee "$outdir/vminfo-after.txt"
 else
-    screencapture -x "$outdir/after.png" >/dev/null 2>&1 || true
+    capture_run_screenshot "$outdir/after.png"
 fi
 
 graphics_alert_rc=0

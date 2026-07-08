@@ -122,7 +122,8 @@ With `TARGET=local`, the runner opens the URL in local Chrome and skips the VM-o
 probes. By default it uses the normal Chrome profile/session and does not close Chrome
 after the run. This avoids creating a second browser profile, but it also means CPU
 sampling covers the matching Chrome process group rather than a fully isolated browser
-instance.
+instance. Local screenshots are captured from the Chrome benchmark window, not from
+the whole desktop, so the local target is also useful as a visual correctness gate.
 
 For suites, the runner executes several workloads and writes aggregate TSV/JSONL files
 so we can compare patched and baseline builds with minimal manual work.
@@ -258,6 +259,9 @@ Local browser controls:
 - `LOCAL_BROWSER`: local browser selector. The default is `chrome`.
 - `LOCAL_BROWSER_APP`: macOS application name used by `open`; default is
   `Google Chrome`.
+- `LOCAL_BROWSER_WIDTH` and `LOCAL_BROWSER_HEIGHT`: requested local Chrome window
+  size. The runner reuses the normal Chrome session and navigates the active tab in
+  the front window.
 - `LOCAL_BROWSER_PROCESS_PATTERN`: process pattern used for local CPU sampling;
   default is `Google Chrome`.
 - `CLEANUP_BROWSER`: defaults to `0` for `TARGET=local` so the runner does not close
@@ -307,7 +311,10 @@ Important files:
   otherwise different from the guest framebuffer.
 - `visual-summary.txt` and `visual-summary.json`: screenshot classifications. The
   classifier ignores the top-left HUD area where possible so a visible overlay does not
-  hide a blank white, black, or gray rendering surface.
+  hide a blank white, black, or gray rendering surface. The `visual_primary_*` lines
+  identify the screenshot that should be used for pass/fail checks. For VM runs this
+  prefers the host VirtualBox window capture, because accelerated output may not be
+  represented in `VBoxManage screenshotpng`.
 - `vminfo-before.txt` and `vminfo-after.txt`: selected VM state snapshots.
 - `vmsvga-stats.xml`: VMSVGA statistics when available.
 - `graphics-alerts.log`: matched graphics-alert lines from logs.
@@ -330,6 +337,30 @@ Suite runs also write aggregate artifacts:
 These files are designed so an agent or script can consume only the small JSONL/TSV
 summaries during development, while detailed logs and screenshots remain available
 when a run regresses.
+
+## Visual Correctness Gate
+
+Every workload is expected to show graphical output while it is running. A completed
+JSON result without visible output is not enough evidence for VirtualBox graphics
+work.
+
+Before blaming a VirtualBox branch, run the same workload locally in Chrome:
+
+```bash
+TARGET=local ALLOW_HEAVY=1 SUITE=all ./dxmtbench.sh
+```
+
+For a healthy benchmark, each workload should produce `browser-result.json` and a
+`visual_primary_measure_mid=visible-varied` line in `visual-summary.txt`. If a
+workload fails that local Chrome check, fix the benchmark first. If it passes locally
+but the VM run is black, white, gray, stale, or missing the expected scene in the
+primary VM screenshot, investigate the VirtualBox guest, device, DXMT, or host
+presentation path for that branch.
+
+The mid-run screenshot is the primary visual signal. Some workloads release or idle
+their WebGL context after measurement, so `after.png` is useful but should not replace
+`measure-mid.png` when deciding whether a benchmark actually rendered during the
+measured interval.
 
 ## Measurement Model
 
