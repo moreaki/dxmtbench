@@ -219,6 +219,12 @@ Common controls:
 - `BASELINE`: previous `suite-results.jsonl` used for comparisons.
 - `VIRTUALBOX_SRC`: optional VirtualBox source checkout used only to record the tested
   source commit in `host-info.txt`.
+- `MIDRUN_SCREENSHOT`: defaults to `1`; captures a screenshot during the measurement
+  window as `measure-mid.png`.
+- `MIDRUN_SCREENSHOT_DELAY`: optional delay in seconds before `measure-mid.png`. The
+  default is half of `DURATION`.
+- `VISUAL_ANALYSIS`: defaults to `1`; classifies screenshots as blank black, blank
+  white, blank gray, low contrast, or varied output.
 
 Workload intensity controls:
 
@@ -279,7 +285,13 @@ Important files:
 - `summary.txt`: compact human-readable run summary.
 - `active.cpu`: sampled active CPU for the host `VirtualBoxVM` process.
 - `VirtualBoxVM.sample.txt`: macOS process sample when available.
-- `before.png` and `after.png`: VirtualBox screenshots around the run.
+- `before.png`, `measure-mid.png`, and `after.png`: screenshots before, during, and
+  after the run. `measure-mid.png` is the most useful check for whether the workload
+  actively rendered, because some tests intentionally release the WebGL context after
+  measurement.
+- `visual-summary.txt` and `visual-summary.json`: screenshot classifications. The
+  classifier ignores the top-left HUD area where possible so a visible overlay does not
+  hide a blank white, black, or gray rendering surface.
 - `vminfo-before.txt` and `vminfo-after.txt`: selected VM state snapshots.
 - `vmsvga-stats.xml`: VMSVGA statistics when available.
 - `graphics-alerts.log`: matched graphics-alert lines from logs.
@@ -396,8 +408,8 @@ A useful development cycle is:
 3. Run `SUITE=default` for routine comparisons.
 4. Run `ALLOW_HEAVY=1 SUITE=heavy` when investigating throughput-sensitive changes.
 5. Compare against a known-good `suite-results.jsonl`.
-6. Inspect `graphics-alerts-summary.txt`, `after.png`, and `browser-events.jsonl`
-   before trusting a run that produced surprising numbers.
+6. Inspect `graphics-alerts-summary.txt`, `measure-mid.png`, `visual-summary.txt`,
+   and `browser-events.jsonl` before trusting a run that produced surprising numbers.
 
 For a host-browser reference run:
 

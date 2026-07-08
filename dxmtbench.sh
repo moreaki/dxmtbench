@@ -66,6 +66,9 @@ allow_hazardous="${ALLOW_HAZARDOUS:-0}"
 allow_heavy="${ALLOW_HEAVY:-0}"
 max_canvas_pixels="${MAX_CANVAS_PIXELS:-4200000}"
 release_context="${RELEASE_CONTEXT:-1}"
+midrun_screenshot="${MIDRUN_SCREENSHOT:-1}"
+midrun_screenshot_delay="${MIDRUN_SCREENSHOT_DELAY:-}"
+visual_analysis="${VISUAL_ANALYSIS:-1}"
 if [[ -n "${CLEANUP_BROWSER:-}" ]]; then
     cleanup_browser="$CLEANUP_BROWSER"
 elif [[ "$target" == "local" ]]; then
@@ -890,6 +893,9 @@ url="http://${url_host}:${port}/bench.html?run=${run_id}&target=${target}&durati
     printf 'allow_heavy=%s\n' "$allow_heavy"
     printf 'max_canvas_pixels=%s\n' "$max_canvas_pixels"
     printf 'release_context=%s\n' "$release_context"
+    printf 'midrun_screenshot=%s\n' "$midrun_screenshot"
+    printf 'midrun_screenshot_delay=%s\n' "$midrun_screenshot_delay"
+    printf 'visual_analysis=%s\n' "$visual_analysis"
     printf 'cleanup_browser=%s\n' "$cleanup_browser"
     printf 'exit_browser_fullscreen=%s\n' "$exit_browser_fullscreen"
     printf 'show_desktop_after_run=%s\n' "$show_desktop_after_run"
@@ -1001,6 +1007,159 @@ summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
 }
 
+capture_run_screenshot() {
+    local path="$1"
+    if [[ "$target" == "vm" ]]; then
+        if "$vboxmanage" showvminfo "$vm" --machinereadable 2>/dev/null | rg -q '^VMState="running"'; then
+            "$vboxmanage" controlvm "$vm" screenshotpng "$path" >/dev/null 2>&1 || true
+        fi
+    else
+        screencapture -x "$path" >/dev/null 2>&1 || true
+    fi
+}
+
+analyze_visuals() {
+    [[ "$visual_analysis" == "1" ]] || return 0
+
+    if ! python3 - "$outdir" <<'PY'
+import json
+import math
+import pathlib
+import sys
+
+outdir = pathlib.Path(sys.argv[1])
+summary_txt = outdir / "visual-summary.txt"
+summary_json = outdir / "visual-summary.json"
+
+try:
+    from PIL import Image, ImageStat
+except Exception as exc:
+    summary_txt.write_text(f"visual_analysis=unavailable reason={exc}\n", encoding="utf-8")
+    summary_json.write_text(json.dumps({"available": False, "reason": str(exc)}, indent=2) + "\n", encoding="utf-8")
+    raise SystemExit(0)
+
+def luma(rgb):
+    return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+
+def classify(mean_luma, std_luma, white_ratio, black_ratio, gray_ratio):
+    if white_ratio >= 0.90:
+        return "blank-white"
+    if black_ratio >= 0.90:
+        return "blank-black"
+    if gray_ratio >= 0.90 and std_luma < 14:
+        return "blank-gray"
+    if white_ratio >= 0.72:
+        return "mostly-white"
+    if black_ratio >= 0.72:
+        return "mostly-black"
+    if gray_ratio >= 0.72 and std_luma < 22:
+        return "mostly-gray"
+    if std_luma < 6:
+        if mean_luma < 28:
+            return "blank-black"
+        if mean_luma > 228:
+            return "blank-white"
+        return "blank-gray"
+    if std_luma < 16:
+        if mean_luma < 45:
+            return "low-contrast-black"
+        if mean_luma > 210:
+            return "low-contrast-white"
+        return "low-contrast-gray"
+    return "visible-varied"
+
+def stats_for(img):
+    stat = ImageStat.Stat(img)
+    mean_rgb = tuple(float(v) for v in stat.mean[:3])
+    std_rgb = tuple(float(v) for v in stat.stddev[:3])
+    mean_luma = luma(mean_rgb)
+    std_luma = math.sqrt(
+        (0.2126 * std_rgb[0]) ** 2 +
+        (0.7152 * std_rgb[1]) ** 2 +
+        (0.0722 * std_rgb[2]) ** 2
+    )
+    sample = img.copy()
+    sample.thumbnail((256, 256))
+    colors = sample.getcolors(maxcolors=65536)
+    unique_sampled = None if colors is None else len(colors)
+    sample_pixels = sample.get_flattened_data() if hasattr(sample, "get_flattened_data") else sample.getdata()
+    sample_lumas = [luma(pixel) for pixel in sample_pixels]
+    sample_count = max(len(sample_lumas), 1)
+    white_ratio = sum(1 for value in sample_lumas if value >= 245) / sample_count
+    black_ratio = sum(1 for value in sample_lumas if value <= 12) / sample_count
+    gray_ratio = sum(1 for value in sample_lumas if 170 <= value <= 235) / sample_count
+    return {
+        "mean_rgb": [round(v, 2) for v in mean_rgb],
+        "stddev_rgb": [round(v, 2) for v in std_rgb],
+        "mean_luma": round(mean_luma, 2),
+        "stddev_luma": round(std_luma, 2),
+        "white_ratio": round(white_ratio, 4),
+        "black_ratio": round(black_ratio, 4),
+        "gray_ratio": round(gray_ratio, 4),
+        "unique_colors_sampled": unique_sampled,
+        "classification": classify(mean_luma, std_luma, white_ratio, black_ratio, gray_ratio),
+    }
+
+def content_region(img):
+    w, h = img.size
+    if w >= 1000 and h >= 700:
+        left = min(max(700, w // 3), max(w - 1, 0))
+        top = min(max(380, h // 3), max(h - 1, 0))
+        return img.crop((left, top, w, h))
+    return img.crop((w // 4, h // 4, max(w // 4 + 1, 3 * w // 4), max(h // 4 + 1, 3 * h // 4)))
+
+entries = []
+for name in ("before.png", "measure-mid.png", "after.png", "no-measure-start.png"):
+    path = outdir / name
+    if not path.exists():
+        continue
+    try:
+        img = Image.open(path).convert("RGB")
+    except Exception as exc:
+        entries.append({"file": name, "error": str(exc)})
+        continue
+    region = content_region(img)
+    entries.append({
+        "file": name,
+        "width": img.width,
+        "height": img.height,
+        "full": stats_for(img),
+        "content": stats_for(region),
+    })
+
+if not entries:
+    summary_txt.write_text("visual_analysis=no_screenshots\n", encoding="utf-8")
+    summary_json.write_text(json.dumps({"available": True, "screenshots": []}, indent=2) + "\n", encoding="utf-8")
+    raise SystemExit(0)
+
+lines = ["visual_analysis=ok"]
+for entry in entries:
+    if "error" in entry:
+        lines.append(f"visual_{entry['file']}=error reason={entry['error']}")
+        continue
+    key = entry["file"].removesuffix(".png").replace("-", "_")
+    content = entry["content"]
+    full = entry["full"]
+    lines.append(
+        "visual_%s=%s %sx%s content_luma=%.2f content_std=%.2f full=%s" % (
+            key,
+            content["classification"],
+            entry["width"],
+            entry["height"],
+            content["mean_luma"],
+            content["stddev_luma"],
+            full["classification"],
+        )
+    )
+
+summary_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
+summary_json.write_text(json.dumps({"available": True, "screenshots": entries}, indent=2) + "\n", encoding="utf-8")
+PY
+    then
+        printf 'visual_analysis=failed\n' > "$outdir/visual-summary.txt"
+    fi
+}
+
 pid=""
 if [[ "$target" == "vm" ]]; then
     pid="$(pid_for_vm)"
@@ -1057,11 +1216,25 @@ if ! wait_for_event "measure-start" 45; then
     else
         screencapture -x "$outdir/no-measure-start.png" >/dev/null 2>&1 || true
     fi
+    analyze_visuals
+    cat "$outdir/visual-summary.txt" >> "$outdir/summary.txt" 2>/dev/null || true
     exit 2
 fi
 
 if [[ "$target" == "vm" ]]; then
     "$vboxmanage" debugvm "$vm" statistics --reset --pattern='*/VMSVGA/*' >/dev/null 2>&1 || true
+fi
+midrun_screenshot_pid=""
+if [[ "$midrun_screenshot" == "1" ]]; then
+    if [[ -z "$midrun_screenshot_delay" ]]; then
+        midrun_screenshot_delay=$((duration / 2))
+        ((midrun_screenshot_delay < 1)) && midrun_screenshot_delay=1
+    fi
+    (
+        sleep "$midrun_screenshot_delay"
+        capture_run_screenshot "$outdir/measure-mid.png"
+    ) &
+    midrun_screenshot_pid=$!
 fi
 sample_seconds="$duration"
 sample_file="$outdir/VirtualBoxVM.sample.txt"
@@ -1085,6 +1258,9 @@ cpu_pid=$!
 wait "$cpu_pid" || true
 if [[ -n "$sample_pid" ]]; then
     wait "$sample_pid" || true
+fi
+if [[ -n "$midrun_screenshot_pid" ]]; then
+    wait "$midrun_screenshot_pid" || true
 fi
 
 if [[ "$target" == "vm" ]] && ! "$vboxmanage" showvminfo "$vm" --machinereadable 2>/dev/null | rg -q '^VMState="running"'; then
@@ -1114,6 +1290,7 @@ if [[ "$target" == "vm" ]]; then
 else
     local_cleanup_after_run
 fi
+analyze_visuals
 
 {
     printf 'outdir=%s\n' "$outdir"
@@ -1236,6 +1413,9 @@ PY
     fi
     if [[ -s "$outdir/graphics-alerts-summary.txt" ]]; then
         cat "$outdir/graphics-alerts-summary.txt"
+    fi
+    if [[ -s "$outdir/visual-summary.txt" ]]; then
+        cat "$outdir/visual-summary.txt"
     fi
 } | tee -a "$outdir/summary.txt"
 
