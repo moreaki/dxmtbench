@@ -69,6 +69,7 @@ release_context="${RELEASE_CONTEXT:-1}"
 midrun_screenshot="${MIDRUN_SCREENSHOT:-1}"
 midrun_screenshot_delay="${MIDRUN_SCREENSHOT_DELAY:-}"
 visual_analysis="${VISUAL_ANALYSIS:-1}"
+host_window_screenshot="${HOST_WINDOW_SCREENSHOT:-1}"
 if [[ -n "${CLEANUP_BROWSER:-}" ]]; then
     cleanup_browser="$CLEANUP_BROWSER"
 elif [[ "$target" == "local" ]]; then
@@ -584,6 +585,31 @@ pid_for_vm() {
     pgrep -nf '/VirtualBoxVM.app/.*/VirtualBoxVM .*--startvm' || true
 }
 
+vm_window_id() {
+    [[ "$target" == "vm" ]] || return 1
+    swift - "$vm" <<'SWIFT' 2>/dev/null || true
+import CoreGraphics
+import Foundation
+
+let vmName = CommandLine.arguments.dropFirst().first ?? ""
+let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+let candidates = windows.compactMap { window -> (Int, CGFloat)? in
+    let owner = window[kCGWindowOwnerName as String] as? String ?? ""
+    guard owner.contains("VirtualBox") else { return nil }
+    let title = window[kCGWindowName as String] as? String ?? ""
+    if !vmName.isEmpty && !title.contains(vmName) { return nil }
+    guard let number = window[kCGWindowNumber as String] as? Int else { return nil }
+    let bounds = window[kCGWindowBounds as String] as? [String: Any] ?? [:]
+    let width = bounds["Width"] as? CGFloat ?? 0
+    let height = bounds["Height"] as? CGFloat ?? 0
+    return (number, width * height)
+}
+if let best = candidates.sorted(by: { $0.1 > $1.1 }).first {
+    print(best.0)
+}
+SWIFT
+}
+
 sample_cpu() {
     local seconds="$1" file="$2" pid="$3"
     : > "$file"
@@ -935,6 +961,7 @@ url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
     printf 'midrun_screenshot=%s\n' "$midrun_screenshot"
     printf 'midrun_screenshot_delay=%s\n' "$midrun_screenshot_delay"
     printf 'visual_analysis=%s\n' "$visual_analysis"
+    printf 'host_window_screenshot=%s\n' "$host_window_screenshot"
     printf 'cleanup_browser=%s\n' "$cleanup_browser"
     printf 'exit_browser_fullscreen=%s\n' "$exit_browser_fullscreen"
     printf 'show_desktop_after_run=%s\n' "$show_desktop_after_run"
@@ -1057,6 +1084,18 @@ capture_run_screenshot() {
     fi
 }
 
+capture_host_window_screenshot() {
+    local path="$1"
+    [[ "$target" == "vm" ]] || return 0
+    [[ "$host_window_screenshot" == "1" ]] || return 0
+
+    local window_id
+    window_id="$(vm_window_id | head -n 1)"
+    if [[ -n "$window_id" ]]; then
+        screencapture -x -l "$window_id" "$path" >/dev/null 2>&1 || true
+    fi
+}
+
 analyze_visuals() {
     [[ "$visual_analysis" == "1" ]] || return 0
 
@@ -1148,7 +1187,16 @@ def content_region(img):
     return img.crop((w // 4, h // 4, max(w // 4 + 1, 3 * w // 4), max(h // 4 + 1, 3 * h // 4)))
 
 entries = []
-for name in ("before.png", "measure-mid.png", "after.png", "no-measure-start.png"):
+for name in (
+    "before.png",
+    "measure-mid.png",
+    "after.png",
+    "no-measure-start.png",
+    "host-before.png",
+    "host-measure-mid.png",
+    "host-after.png",
+    "host-no-measure-start.png",
+):
     path = outdir / name
     if not path.exists():
         continue
@@ -1227,6 +1275,7 @@ done
 
 if [[ "$target" == "vm" ]]; then
     "$vboxmanage" controlvm "$vm" screenshotpng "$outdir/before.png" >/dev/null 2>&1 || true
+    capture_host_window_screenshot "$outdir/host-before.png"
     open_url_in_guest "$url"
 else
     screencapture -x "$outdir/before.png" >/dev/null 2>&1 || true
@@ -1250,6 +1299,7 @@ if ! wait_for_event "measure-start" 45; then
         capture_crash_diagnostics "measure-start-timeout"
         if "$vboxmanage" showvminfo "$vm" --machinereadable 2>/dev/null | rg -q '^VMState="running"'; then
             "$vboxmanage" controlvm "$vm" screenshotpng "$outdir/no-measure-start.png" >/dev/null 2>&1 || true
+            capture_host_window_screenshot "$outdir/host-no-measure-start.png"
         fi
         cat "$outdir/crash-summary.txt" >> "$outdir/summary.txt" 2>/dev/null || true
     else
@@ -1271,6 +1321,7 @@ if [[ "$midrun_screenshot" == "1" ]]; then
     (
         sleep "$midrun_screenshot_delay"
         capture_run_screenshot "$outdir/measure-mid.png"
+        capture_host_window_screenshot "$outdir/host-measure-mid.png"
     ) &
     midrun_screenshot_pid=$!
 fi
@@ -1314,6 +1365,7 @@ if [[ "$target" == "vm" ]]; then
         --pattern='*/VMSVGA/Cmd/*|*/VMSVGA/DX/*|*/VMSVGA/Fifo*|*/VMSVGA/Reg/Command*|*/VMSVGA/Reg/DevCap*|*/VMSVGA/Reg/Cursor*' \
         > "$outdir/vmsvga-stats.xml" 2>"$outdir/vmsvga-stats.err" || true
     "$vboxmanage" controlvm "$vm" screenshotpng "$outdir/after.png" >/dev/null 2>&1 || true
+    capture_host_window_screenshot "$outdir/host-after.png"
     "$vboxmanage" showvminfo "$vm" --machinereadable \
         | rg '^(VMState|VideoMode|accelerate3d|vram|graphicscontroller|clipboard|GuestAdditionsRunLevel)=' \
         | tee "$outdir/vminfo-after.txt"

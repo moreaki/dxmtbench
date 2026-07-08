@@ -231,6 +231,9 @@ Common controls:
   post-run WebGL context release for a rendering failure.
 - `VISUAL_ANALYSIS`: defaults to `1`; classifies screenshots as blank black, blank
   white, blank gray, low contrast, or varied output.
+- `HOST_WINDOW_SCREENSHOT`: defaults to `1` for VM runs; captures the actual macOS
+  VirtualBoxVM window in addition to the guest framebuffer. This catches host
+  presentation failures that `VBoxManage screenshotpng` cannot see.
 
 Workload intensity controls:
 
@@ -294,10 +297,14 @@ Important files:
 - `summary.txt`: compact human-readable run summary.
 - `active.cpu`: sampled active CPU for the host `VirtualBoxVM` process.
 - `VirtualBoxVM.sample.txt`: macOS process sample when available.
-- `before.png`, `measure-mid.png`, and `after.png`: screenshots before, during, and
-  after the run. `measure-mid.png` is the most useful check for whether the workload
-  actively rendered, because some tests intentionally release the WebGL context after
-  measurement.
+- `before.png`, `measure-mid.png`, and `after.png`: guest framebuffer screenshots
+  before, during, and after the run. `measure-mid.png` is the most useful guest-side
+  check for whether the workload actively rendered, because some tests intentionally
+  release the WebGL context after measurement.
+- `host-before.png`, `host-measure-mid.png`, and `host-after.png`: macOS window
+  captures of the VirtualBoxVM output window for VM runs. These are the files to
+  inspect when checking that the user-visible window is not blank, stale, gray, or
+  otherwise different from the guest framebuffer.
 - `visual-summary.txt` and `visual-summary.json`: screenshot classifications. The
   classifier ignores the top-left HUD area where possible so a visible overlay does not
   hide a blank white, black, or gray rendering surface.
@@ -417,8 +424,9 @@ A useful development cycle is:
 3. Run `SUITE=default` for routine comparisons.
 4. Run `ALLOW_HEAVY=1 SUITE=heavy` when investigating throughput-sensitive changes.
 5. Compare against a known-good `suite-results.jsonl`.
-6. Inspect `graphics-alerts-summary.txt`, `measure-mid.png`, `visual-summary.txt`,
-   and `browser-events.jsonl` before trusting a run that produced surprising numbers.
+6. Inspect `graphics-alerts-summary.txt`, `measure-mid.png`, `host-measure-mid.png`,
+   `visual-summary.txt`, and `browser-events.jsonl` before trusting a run that
+   produced surprising numbers.
 
 For a host-browser reference run:
 
