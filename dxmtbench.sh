@@ -612,13 +612,17 @@ if status == "ok" and (outdir / "visual-summary.txt").exists() and not visual_mi
         "metric": "measure-mid",
         "message": "primary mid-run screenshot was not available",
     })
-elif visual_mid_class and visual_mid_class != "visible-varied":
+elif (
+    visual_mid_class
+    and visual_mid_class != "visible-varied"
+    and visual_mid_signature != "present"
+):
     alerts.append({
         "kind": "visual-primary",
         "metric": "measure-mid",
         "actual": visual_mid_class,
         "source": visual_mid_source,
-        "message": "primary mid-run screenshot did not show varied graphical output",
+        "message": "primary mid-run screenshot did not show varied graphical output or the current workload/run visual signature",
     })
 if visual_mid_signature and visual_mid_signature != "present":
     alerts.append({
