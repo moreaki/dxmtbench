@@ -32,6 +32,7 @@ fi
 
 duration="${DURATION:-45}"
 warmup="${WARMUP:-5}"
+start_delay_ms="${START_DELAY_MS:-0}"
 instances="${INSTANCES:-512}"
 dpr="${DPR:-auto}"
 workload="${WORKLOAD:-cubes-fill}"
@@ -71,7 +72,7 @@ else
 fi
 guest_browser_exe="${GUEST_BROWSER_EXE:-msedge}"
 guest_browser_profile="${GUEST_BROWSER_PROFILE:-}"
-guest_browser_flags="${GUEST_BROWSER_FLAGS:---no-first-run --disable-direct-composition --disable-features=DirectCompositionSwapChain,UseDirectCompositionVideoOverlays}"
+guest_browser_flags="${GUEST_BROWSER_FLAGS:---no-first-run --start-maximized --disable-direct-composition --disable-features=DirectCompositionSwapChain,UseDirectCompositionVideoOverlays}"
 guest_kill_browser_before_run="${GUEST_KILL_BROWSER_BEFORE_RUN:-0}"
 local_browser="${LOCAL_BROWSER:-chrome}"
 local_browser_app="${LOCAL_BROWSER_APP:-Google Chrome}"
@@ -1051,8 +1052,11 @@ maximize_guest_browser_window() {
     [[ "$guest_browser_maximize" == "1" ]] || return 0
     [[ "$browser_fullscreen" == "1" ]] && return 0
 
-    # Win+Up maximizes the active browser window without entering browser fullscreen.
-    key_scancodes e0 5b e0 48 e0 c8 e0 db
+    # Alt+Space, X asks the active window's system menu to maximize without entering
+    # browser fullscreen or cycling through Win+Up snap states on repeated runs.
+    key_scancodes 38 39 b9 b8
+    sleep 0.2
+    key_scancodes 2d ad
     sleep 0.8
 }
 
@@ -1226,6 +1230,7 @@ python3 - "$bench_config_file" \
     target "$target" \
     duration "$((duration * 1000))" \
     warmup "$((warmup * 1000))" \
+    startDelay "$start_delay_ms" \
     instances "$instances" \
     dpr "$dpr" \
     workload "$workload" \
@@ -1277,6 +1282,7 @@ url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
     printf 'external_server=%s\n' "$external_server"
     printf 'duration=%ss\n' "$duration"
     printf 'warmup=%ss\n' "$warmup"
+    printf 'start_delay_ms=%s\n' "$start_delay_ms"
     printf 'instances=%s\n' "$instances"
     printf 'dpr=%s\n' "$dpr"
     printf 'workload=%s\n' "$workload"

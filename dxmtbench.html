@@ -108,6 +108,7 @@ function readParam(name, fallback) {
 
 const durationMs = Math.max(1000, Number(readParam("duration", "45000")));
 const warmupMs = Math.max(0, Number(readParam("warmup", "5000")));
+const startDelayMs = Math.max(0, Number(readParam("startDelay", "0")));
 const instances = Math.max(1, Number(readParam("instances", "512")));
 const requestedDpr = readParam("dpr", "auto");
 const workloadName = readParam("workload", "cubes-fill");
@@ -157,6 +158,7 @@ const gl = canvas.getContext("webgl2", {
 const config = {
     durationMs,
     warmupMs,
+    startDelayMs,
     instances,
     requestedDpr,
     workload: workloadName,
@@ -1902,7 +1904,16 @@ try {
         emitEvent("webgl-context-lost", { phase: state.phase });
         setMetric("phase", "context lost", "warn");
     }, false);
-    runBenchmark();
+    if (startDelayMs > 0) {
+        setMetric("phase", "start delay");
+        emitEvent("start-delay", { startDelayMs, workload: workloadName, config });
+        setTimeout(() => {
+            resizeCanvas();
+            runBenchmark();
+        }, startDelayMs);
+    } else {
+        runBenchmark();
+    }
 } catch (err) {
     failBenchmark(err, "setup");
 }

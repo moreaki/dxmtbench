@@ -233,6 +233,9 @@ Common controls:
 - `SUITE`: workload suite name, such as `smoke`, `default`, `heavy`, or `all`.
 - `DURATION`: measured runtime in seconds.
 - `WARMUP`: warmup time before measurement.
+- `START_DELAY_MS`: optional browser-side delay before WebGL setup starts. This is
+  useful for VM automation where the runner opens the URL first and then maximizes the
+  normal browser window before measurement.
 - `DPR`: device pixel ratio override, or `auto`.
 - `MAX_CANVAS_PIXELS`: canvas pixel cap. This defaults to a safer capped value.
   Raise it for explicit 4K or Retina throughput runs; for example,
