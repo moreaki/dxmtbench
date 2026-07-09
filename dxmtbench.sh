@@ -1569,6 +1569,18 @@ def content_region(img):
 def signature_for(img):
     if not expected_signature:
         return {"available": False}
+    def count_in(sample_img):
+        sample = sample_img.copy()
+        sample.thumbnail((1280, 1280))
+        counts = [0 for _ in expected_signature]
+        max_distance_sq = 72 * 72
+        pixels = sample.get_flattened_data() if hasattr(sample, "get_flattened_data") else sample.getdata()
+        for r, g, b in pixels:
+            for i, (er, eg, eb) in enumerate(expected_signature):
+                if (r - er) * (r - er) + (g - eg) * (g - eg) + (b - eb) * (b - eb) <= max_distance_sq:
+                    counts[i] += 1
+        return counts
+
     w, h = img.size
     region = img.crop((
         max(0, w - max(520, w // 3)),
@@ -1576,23 +1588,24 @@ def signature_for(img):
         w,
         h,
     ))
-    sample = region.copy()
-    sample.thumbnail((1280, 1280))
-    counts = [0 for _ in expected_signature]
-    max_distance_sq = 72 * 72
-    pixels = sample.get_flattened_data() if hasattr(sample, "get_flattened_data") else sample.getdata()
-    for r, g, b in pixels:
-        for i, (er, eg, eb) in enumerate(expected_signature):
-            if (r - er) * (r - er) + (g - eg) * (g - eg) + (b - eb) * (b - eb) <= max_distance_sq:
-                counts[i] += 1
+    counts = count_in(region)
     min_count = 180
     hits = sum(1 for count in counts if count >= min_count)
+    source = "bottom-right"
+    if hits < 3:
+        full_counts = count_in(img)
+        full_hits = sum(1 for count in full_counts if count >= min_count)
+        if full_hits > hits:
+            counts = full_counts
+            hits = full_hits
+            source = "full"
     return {
         "available": True,
         "present": hits >= 3,
         "hits": hits,
         "total": len(expected_signature),
         "counts": counts,
+        "source": source,
         "expected": [list(color) for color in expected_signature],
     }
 
