@@ -61,7 +61,8 @@ The benchmark has three parts.
 
 ```mermaid
 flowchart LR
-    A["Host runner<br/>dxmtbench.sh"] --> B["Host HTTP server<br/>dxmtbench-server.py"]
+    A["Host runner<br/>dxmtbench.sh"] --> J["Runner helpers<br/>dxmtbench.py"]
+    A --> B["Host HTTP server<br/>dxmtbench-server.py"]
     A --> C["VBoxManage for TARGET=vm<br/>type URL, screenshots, stats"]
     A --> H["Chrome for TARGET=local<br/>open URL, host screenshots, process sampling"]
     B --> D["Benchmark page<br/>dxmtbench.html"]
@@ -112,7 +113,10 @@ format.
 
 The shell runner is the orchestration layer. It starts the server, opens the benchmark
 URL, waits for progress and completion, samples host-side process statistics, captures
-screenshots, and writes one run directory per invocation.
+screenshots, and writes one run directory per invocation. Python-heavy work such as
+JSON event emission, suite result aggregation, crash-report parsing, browser-result
+formatting, and screenshot visual analysis lives in `dxmtbench.py`; the shell script
+only calls those helper subcommands.
 
 With `TARGET=vm`, the runner uses `VBoxManage` to open the URL in the guest, capture
 VM screenshots, gather selected VM state, collect VMSVGA statistics, and scan the VM
