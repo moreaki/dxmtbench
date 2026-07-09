@@ -116,6 +116,7 @@ outdir="${OUTDIR:-$outroot/$(date +%Y%m%d-%H%M%S)}"
 html="$script_dir/dxmtbench.html"
 server_py="$script_dir/dxmtbench-server.py"
 bench_py="$script_dir/dxmtbench.py"
+macos_window_id_swift="$script_dir/tools/macos-window-id.swift"
 
 find_port() {
     python3 "$bench_py" find-port
@@ -327,61 +328,21 @@ pid_for_vm() {
     pgrep -nf '/VirtualBoxVM.app/.*/VirtualBoxVM .*--startvm' || true
 }
 
-browser_window_id() {
-    [[ "$target" == "local" ]] || return 1
-    swift - "$local_browser_app" "$run_id" <<'SWIFT' 2>/dev/null || true
-import CoreGraphics
-import Foundation
+macos_window_id() {
+    [[ "$(uname -s)" == "Darwin" ]] || return 0
+    command -v swift >/dev/null 2>&1 || return 0
+    [[ -f "$macos_window_id_swift" ]] || return 0
+    swift "$macos_window_id_swift" "$@" 2>/dev/null || true
+}
 
-let args = Array(CommandLine.arguments.dropFirst())
-let appName = args.first ?? "Google Chrome"
-let runId = args.count > 1 ? args[1] : ""
-let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
-let candidates = windows.compactMap { window -> (Int, Int, CGFloat)? in
-    let owner = window[kCGWindowOwnerName as String] as? String ?? ""
-    guard owner == appName || owner.contains(appName) else { return nil }
-    let title = window[kCGWindowName as String] as? String ?? ""
-    guard title.contains("DXMTBench") else { return nil }
-    if !runId.isEmpty && !title.contains(runId) { return nil }
-    guard let number = window[kCGWindowNumber as String] as? Int else { return nil }
-    let layer = window[kCGWindowLayer as String] as? Int ?? 0
-    let bounds = window[kCGWindowBounds as String] as? [String: Any] ?? [:]
-    let width = bounds["Width"] as? CGFloat ?? 0
-    let height = bounds["Height"] as? CGFloat ?? 0
-    return (number, layer, width * height)
-}
-if let best = candidates.sorted(by: { lhs, rhs in
-    if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
-    return lhs.2 > rhs.2
-}).first {
-    print(best.0)
-}
-SWIFT
+browser_window_id() {
+    [[ "$target" == "local" ]] || return 0
+    macos_window_id browser "$local_browser_app" "$run_id"
 }
 
 vm_window_id() {
-    [[ "$target" == "vm" ]] || return 1
-    swift - "$vm" <<'SWIFT' 2>/dev/null || true
-import CoreGraphics
-import Foundation
-
-let vmName = CommandLine.arguments.dropFirst().first ?? ""
-let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
-let candidates = windows.compactMap { window -> (Int, CGFloat)? in
-    let owner = window[kCGWindowOwnerName as String] as? String ?? ""
-    guard owner.contains("VirtualBox") else { return nil }
-    let title = window[kCGWindowName as String] as? String ?? ""
-    if !vmName.isEmpty && !title.contains(vmName) { return nil }
-    guard let number = window[kCGWindowNumber as String] as? Int else { return nil }
-    let bounds = window[kCGWindowBounds as String] as? [String: Any] ?? [:]
-    let width = bounds["Width"] as? CGFloat ?? 0
-    let height = bounds["Height"] as? CGFloat ?? 0
-    return (number, width * height)
-}
-if let best = candidates.sorted(by: { $0.1 > $1.1 }).first {
-    print(best.0)
-}
-SWIFT
+    [[ "$target" == "vm" ]] || return 0
+    macos_window_id vm "$vm"
 }
 
 focus_vm_window() {

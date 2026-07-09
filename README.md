@@ -62,6 +62,7 @@ The benchmark has three parts.
 ```mermaid
 flowchart LR
     A["Host runner<br/>dxmtbench.sh"] --> J["Runner helpers<br/>dxmtbench.py"]
+    A --> K["Platform helpers<br/>tools/"]
     A --> B["Host HTTP server<br/>dxmtbench-server.py"]
     A --> C["VBoxManage for TARGET=vm<br/>type URL, screenshots, stats"]
     A --> H["Chrome for TARGET=local<br/>open URL, host screenshots, process sampling"]
@@ -117,6 +118,12 @@ screenshots, and writes one run directory per invocation. Python-heavy work such
 JSON event emission, suite result aggregation, crash-report parsing, browser-result
 formatting, and screenshot visual analysis lives in `dxmtbench.py`; the shell script
 only calls those helper subcommands.
+
+The runner keeps platform-specific host integration in separate helper files. Today
+`tools/macos-window-id.swift` contains the macOS `CGWindowList` lookup used to capture
+Chrome and VirtualBoxVM windows by window id. On non-macOS hosts this lookup is
+skipped, while the core browser/server/result path remains usable for local browser
+comparisons and future Linux or Windows host adapters.
 
 With `TARGET=vm`, the runner uses `VBoxManage` to open the URL in the guest, capture
 VM screenshots, gather selected VM state, collect VMSVGA statistics, and scan the VM
@@ -257,7 +264,9 @@ Common controls:
   white, blank gray, low contrast, or varied output.
 - `HOST_WINDOW_SCREENSHOT`: defaults to `1` for VM runs; captures the actual macOS
   VirtualBoxVM window in addition to the guest framebuffer. This catches host
-  presentation failures that `VBoxManage screenshotpng` cannot see.
+  presentation failures that `VBoxManage screenshotpng` cannot see. The current
+  implementation uses `tools/macos-window-id.swift` and `screencapture`, so this
+  specific host-window capture path is macOS-only.
 - `FOCUS_SCREENSHOT_WINDOW`: defaults to `1` for VM host-window screenshots. The
   runner brings the VirtualBox window forward before capturing it so `screencapture`
   does not read a stale background-window backing store.
@@ -360,7 +369,8 @@ Important files:
 - `host-before.png`, `host-measure-mid.png`, and `host-after.png`: macOS window
   captures of the VirtualBoxVM output window for VM runs. These are the files to
   inspect when checking that the user-visible window is not blank, stale, gray, or
-  otherwise different from the guest framebuffer.
+  otherwise different from the guest framebuffer. These files are produced only when
+  the macOS window-id helper and `screencapture` path are available.
 - `visual-summary.txt` and `visual-summary.json`: screenshot classifications. The
   classifier ignores the top-left HUD area where possible so a visible overlay does not
   hide a blank white, black, or gray rendering surface. The `visual_primary_*` lines
