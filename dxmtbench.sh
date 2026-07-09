@@ -37,6 +37,13 @@ dpr="${DPR:-auto}"
 workload="${WORKLOAD:-cubes-fill}"
 suite="${SUITE:-}"
 suite_print="${SUITE_PRINT:-compact}"
+suite_port="${SUITE_PORT:-}"
+suite_persistent_server="${SUITE_PERSISTENT_SERVER:-1}"
+suite_inter_run_delay="${SUITE_INTER_RUN_DELAY:-}"
+suite_reset_vm_between_runs="${SUITE_RESET_VM_BETWEEN_RUNS:-0}"
+suite_reset_settle_seconds="${SUITE_RESET_SETTLE_SECONDS:-5}"
+external_server="${EXTERNAL_SERVER:-0}"
+server_config_file_override="${SERVER_CONFIG_FILE:-}"
 baseline="${BASELINE:-${BASELINE_SUITE:-}}"
 fps_regression_pct="${FPS_REGRESSION_PCT:-7}"
 frame_ms_regression_pct="${FRAME_MS_REGRESSION_PCT:-15}"
@@ -53,14 +60,25 @@ mode="${MODE:-raf}"
 chunk_ms="${CHUNK_MS:-25}"
 finish_each_frame="${FINISH:-0}"
 sync_every="${SYNC_EVERY:-0}"
-browser_fullscreen="${BROWSER_FULLSCREEN:-1}"
-launch_method="${LAUNCH_METHOD:-keyboard}"
+browser_fullscreen="${BROWSER_FULLSCREEN:-0}"
+if [[ -n "${LAUNCH_METHOD:-}" ]]; then
+    launch_method="$LAUNCH_METHOD"
+elif [[ "$target" == "vm" ]]; then
+    launch_method="keyboard"
+else
+    launch_method="browser"
+fi
+guest_browser_exe="${GUEST_BROWSER_EXE:-msedge}"
+guest_browser_profile="${GUEST_BROWSER_PROFILE:-}"
+guest_browser_flags="${GUEST_BROWSER_FLAGS:---no-first-run --disable-direct-composition --disable-features=DirectCompositionSwapChain,UseDirectCompositionVideoOverlays}"
+guest_kill_browser_before_run="${GUEST_KILL_BROWSER_BEFORE_RUN:-0}"
 local_browser="${LOCAL_BROWSER:-chrome}"
 local_browser_app="${LOCAL_BROWSER_APP:-Google Chrome}"
 local_browser_process_pattern="${LOCAL_BROWSER_PROCESS_PATTERN:-Google Chrome}"
 local_browser_args="${LOCAL_BROWSER_ARGS:-}"
 local_browser_width="${LOCAL_BROWSER_WIDTH:-1600}"
 local_browser_height="${LOCAL_BROWSER_HEIGHT:-1000}"
+local_browser_isolated="${LOCAL_BROWSER_ISOLATED:-1}"
 virtualbox_src="${VIRTUALBOX_SRC:-}"
 allow_hazardous="${ALLOW_HAZARDOUS:-0}"
 allow_heavy="${ALLOW_HEAVY:-0}"
@@ -70,21 +88,41 @@ midrun_screenshot="${MIDRUN_SCREENSHOT:-1}"
 midrun_screenshot_delay="${MIDRUN_SCREENSHOT_DELAY:-}"
 visual_analysis="${VISUAL_ANALYSIS:-1}"
 host_window_screenshot="${HOST_WINDOW_SCREENSHOT:-1}"
+focus_screenshot_window="${FOCUS_SCREENSHOT_WINDOW:-1}"
 if [[ -n "${CLEANUP_BROWSER:-}" ]]; then
     cleanup_browser="$CLEANUP_BROWSER"
+elif [[ "$target" == "local" && "$local_browser_isolated" == "1" ]]; then
+    cleanup_browser="1"
 elif [[ "$target" == "local" ]]; then
     cleanup_browser="0"
 else
-    cleanup_browser="1"
+    cleanup_browser="0"
+fi
+if [[ -z "$suite_inter_run_delay" ]]; then
+    if [[ "$target" == "vm" ]]; then
+        suite_inter_run_delay="3"
+    else
+        suite_inter_run_delay="0"
+    fi
 fi
 exit_browser_fullscreen="${EXIT_BROWSER_FULLSCREEN:-1}"
-show_desktop_after_run="${SHOW_DESKTOP_AFTER_RUN:-1}"
+show_desktop_after_run="${SHOW_DESKTOP_AFTER_RUN:-0}"
 fail_on_graphics_alert="${FAIL_ON_GRAPHICS_ALERT:-1}"
 run_start_unix="$(date +%s)"
 outroot="${OUTROOT:-$script_dir/dxmtbench-runs}"
 outdir="${OUTDIR:-$outroot/$(date +%Y%m%d-%H%M%S)}"
 html="$script_dir/dxmtbench.html"
 server_py="$script_dir/dxmtbench-server.py"
+
+find_port() {
+    python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
 
 is_heavy_workload() {
     case "$1" in
@@ -126,6 +164,64 @@ check_hazardous_config() {
 
 check_hazardous_config
 
+reset_vm_for_suite_workload() {
+    [[ "$target" == "vm" ]] || return 0
+    python3 - "$vboxmanage" "$vm" "$suite_reset_settle_seconds" <<'PY'
+import subprocess
+import sys
+import time
+
+vboxmanage, vm, settle_s = sys.argv[1:4]
+settle = max(0.0, float(settle_s))
+subprocess.run([vboxmanage, "controlvm", vm, "reset"], check=True, timeout=30)
+deadline = time.time() + 180
+while time.time() < deadline:
+    info = subprocess.run(
+        [vboxmanage, "showvminfo", vm, "--machinereadable"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=10,
+    ).stdout
+    values = {}
+    for line in info.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in {"VMState", "GuestAdditionsRunLevel", "VideoMode"}:
+            values[key] = value.strip('"')
+    props = subprocess.run(
+        [vboxmanage, "guestproperty", "enumerate", vm],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=10,
+    ).stdout
+    net_status = ""
+    net_ip = ""
+    for line in props.splitlines():
+        if "/VirtualBox/GuestInfo/Net/0/Status" in line:
+            net_status = line.split("= '", 1)[-1].split("'", 1)[0]
+        elif "/VirtualBox/GuestInfo/Net/0/V4/IP" in line:
+            net_ip = line.split("= '", 1)[-1].split("'", 1)[0]
+    print(" ".join(f"{key}={value}" for key, value in values.items()) + f" net={net_status} ip={net_ip}", flush=True)
+    if (
+        values.get("VMState") == "running"
+        and values.get("GuestAdditionsRunLevel") == "3"
+        and net_status == "Up"
+        and net_ip.startswith("10.0.2.")
+    ):
+        if settle:
+            time.sleep(settle)
+        raise SystemExit(0)
+    time.sleep(2)
+print("guest_ready_timeout=1", flush=True)
+raise SystemExit(1)
+PY
+}
+
 if [[ -n "$suite" && "${RUN_ONE:-0}" != "1" ]]; then
     case "$suite" in
         1|default)
@@ -157,6 +253,28 @@ if [[ -n "$suite" && "${RUN_ONE:-0}" != "1" ]]; then
 
     suite_root="${OUTDIR:-$outroot/$(date +%Y%m%d-%H%M%S)-suite}"
     mkdir -p "$suite_root"
+    suite_port_selected=""
+    suite_server_pid=""
+    suite_config_file=""
+    if [[ "$target" == "vm" ]]; then
+        suite_port_selected="${PORT:-$suite_port}"
+        if [[ -z "$suite_port_selected" ]]; then
+            suite_port_selected="$(find_port)"
+        fi
+        if [[ "$suite_persistent_server" == "1" ]]; then
+            suite_config_file="$suite_root/suite-current-config.json"
+            suite_server_dir="$suite_root/server"
+            mkdir -p "$suite_server_dir"
+            printf '{}\n' > "$suite_config_file"
+            python3 "$server_py" --bind "0.0.0.0" --port "$suite_port_selected" --root "$script_dir" --html "$html" --outdir "$suite_server_dir" --config "$suite_config_file" >"$suite_server_dir/server.stdout" 2>"$suite_server_dir/server.stderr" &
+            suite_server_pid=$!
+            trap 'if [[ -n "${suite_server_pid:-}" ]]; then kill "$suite_server_pid" >/dev/null 2>&1 || true; fi' EXIT
+            for _ in {1..20}; do
+                [[ -s "$suite_server_dir/server-ready.txt" ]] && break
+                sleep 0.25
+            done
+        fi
+    fi
     suite_tsv="$suite_root/suite-summary.tsv"
     suite_jsonl="$suite_root/suite-results.jsonl"
     suite_events="$suite_root/suite-events.jsonl"
@@ -167,6 +285,13 @@ if [[ -n "$suite" && "${RUN_ONE:-0}" != "1" ]]; then
     : > "$suite_jsonl"
     : > "$suite_events"
     : > "$suite_alerts"
+    if [[ -n "$suite_port_selected" ]]; then
+        printf 'suite_port=%s\n' "$suite_port_selected" > "$suite_root/suite-network.txt"
+        if [[ -n "$suite_config_file" ]]; then
+            printf 'suite_persistent_server=1\n' >> "$suite_root/suite-network.txt"
+            printf 'suite_config_file=%s\n' "$suite_config_file" >> "$suite_root/suite-network.txt"
+        fi
+    fi
 
     IFS=',' read -r -a suite_items <<< "$suite"
     total_items=0
@@ -177,6 +302,7 @@ if [[ -n "$suite" && "${RUN_ONE:-0}" != "1" ]]; then
     printf 'running suite_root=%s total=%s\n' "$suite_root" "$total_items" > "$suite_status"
     python3 - "$suite_events" "$suite_latest" "$suite_root" "$total_items" "$mode" "$baseline" <<'PY'
 import json
+import hashlib
 import pathlib
 import sys
 import time
@@ -208,9 +334,17 @@ PY
         child_out="$suite_root/$item"
         mkdir -p "$child_out"
         console_log="$child_out/runner.console.log"
+        if [[ "$suite_reset_vm_between_runs" == "1" ]]; then
+            if ! reset_vm_for_suite_workload > "$child_out/vm-reset.log" 2>&1; then
+                printf 'vm reset failed before workload=%s; see %s\n' "$item" "$child_out/vm-reset.log" > "$console_log"
+                printf 'suite_stop_on_alert workload=%s reason=vm-reset-failed\n' "$item"
+                break
+            fi
+        fi
         printf 'running workload=%s index=%s/%s outdir=%s\n' "$item" "$index" "$total_items" "$child_out" > "$suite_status"
         python3 - "$suite_events" "$suite_latest" "$suite_root" "$item" "$index" "$total_items" "$child_out" <<'PY'
 import json
+import hashlib
 import pathlib
 import sys
 import time
@@ -235,12 +369,21 @@ PY
             *) printf 'suite_run workload=%s index=%s/%s\n' "$item" "$index" "$total_items" ;;
         esac
         set +e
-        TARGET="$target" RUN_ONE=1 WORKLOAD="$item" OUTDIR="$child_out" "$0" >"$console_log" 2>&1
+        if [[ -n "$suite_port_selected" ]]; then
+            if [[ -n "$suite_config_file" ]]; then
+                TARGET="$target" RUN_ONE=1 WORKLOAD="$item" OUTDIR="$child_out" PORT="$suite_port_selected" EXTERNAL_SERVER=1 SERVER_CONFIG_FILE="$suite_config_file" "$0" >"$console_log" 2>&1
+            else
+                TARGET="$target" RUN_ONE=1 WORKLOAD="$item" OUTDIR="$child_out" PORT="$suite_port_selected" "$0" >"$console_log" 2>&1
+            fi
+        else
+            TARGET="$target" RUN_ONE=1 WORKLOAD="$item" OUTDIR="$child_out" "$0" >"$console_log" 2>&1
+        fi
         rc=$?
         set -e
 
         python3 - "$item" "$child_out" "$rc" "$suite_tsv" "$suite_jsonl" "$suite_events" "$suite_alerts" "$suite_latest" "$suite_status" "$suite_root" "$baseline" "$fps_regression_pct" "$frame_ms_regression_pct" "$cpu_regression_pct" "$suite_print" "$index" "$total_items" <<'PY'
 import json
+import hashlib
 import pathlib
 import sys
 import time
@@ -415,6 +558,23 @@ alerts = []
 if status != "ok":
     alerts.append({"kind": "status", "message": status})
 
+summary_text = ""
+summary_path = outdir / "summary.txt"
+if summary_path.exists():
+    summary_text = summary_path.read_text(encoding="utf-8", errors="replace")
+browser_events_path = outdir / "browser-events.jsonl"
+has_browser_events = browser_events_path.exists() and browser_events_path.stat().st_size > 0
+if status != "ok" and "script-start event not observed" in summary_text and not has_browser_events:
+    alerts.append({
+        "kind": "transport-no-script-start",
+        "message": "browser did not load the benchmark page; no script-start event was posted",
+    })
+if status != "ok" and "measure-start event not observed" in summary_text:
+    alerts.append({
+        "kind": "browser-no-measure-start",
+        "message": "benchmark page did not reach the measured rendering phase",
+    })
+
 def load_visual_primary(path):
     summary = pathlib.Path(path) / "visual-summary.txt"
     if not summary.exists():
@@ -441,7 +601,16 @@ visual_primary = load_visual_primary(outdir)
 visual_mid = visual_primary.get("measure_mid", {})
 visual_mid_class = visual_mid.get("classification")
 visual_mid_source = visual_mid.get("source")
-if visual_mid_class and visual_mid_class != "visible-varied":
+visual_mid_signature = visual_mid.get("signature")
+visual_mid_hash = None
+visual_hash_duplicate = None
+if status == "ok" and (outdir / "visual-summary.txt").exists() and not visual_mid_class:
+    alerts.append({
+        "kind": "visual-primary-missing",
+        "metric": "measure-mid",
+        "message": "primary mid-run screenshot was not available",
+    })
+elif visual_mid_class and visual_mid_class != "visible-varied":
     alerts.append({
         "kind": "visual-primary",
         "metric": "measure-mid",
@@ -449,6 +618,35 @@ if visual_mid_class and visual_mid_class != "visible-varied":
         "source": visual_mid_source,
         "message": "primary mid-run screenshot did not show varied graphical output",
     })
+if visual_mid_signature and visual_mid_signature != "present":
+    alerts.append({
+        "kind": "visual-primary-signature",
+        "metric": "measure-mid",
+        "actual": visual_mid_signature,
+        "source": visual_mid_source,
+        "message": "primary mid-run screenshot did not contain the current workload/run visual signature",
+    })
+if visual_mid_source:
+    visual_source_path = outdir / visual_mid_source
+    if visual_source_path.exists():
+        visual_mid_hash = hashlib.sha256(visual_source_path.read_bytes()).hexdigest()
+        hash_path = pathlib.Path(suite_root) / "suite-visual-primary-hashes.tsv"
+        if hash_path.exists():
+            for line in hash_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 3 and parts[2] == visual_mid_hash and parts[0] != workload:
+                    visual_hash_duplicate = {"workload": parts[0], "source": parts[1]}
+                    alerts.append({
+                        "kind": "visual-primary-duplicate",
+                        "metric": "measure-mid",
+                        "actual": visual_mid_hash[:16],
+                        "source": visual_mid_source,
+                        "duplicateOf": parts[0],
+                        "message": "primary mid-run screenshot is byte-identical to an earlier workload",
+                    })
+                    break
+        with hash_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{workload}\t{visual_mid_source}\t{visual_mid_hash}\n")
 
 baseline = load_baseline(baseline_path_s).get(workload)
 if baseline:
@@ -504,6 +702,9 @@ metrics = {
     "uploadMiBPerSecond": parse_float(throughput.get("uploadMiBPerSecond")),
     "visualPrimaryMeasureMid": visual_mid_class,
     "visualPrimaryMeasureMidSource": visual_mid_source,
+    "visualPrimaryMeasureMidSignature": visual_mid_signature,
+    "visualPrimaryMeasureMidHash": visual_mid_hash[:16] if visual_mid_hash else None,
+    "visualPrimaryDuplicateOf": visual_hash_duplicate,
 }
 event = {
     "event": "suite-workload-result",
@@ -564,6 +765,9 @@ PY
             esac
             break
         fi
+        if [[ "$suite_inter_run_delay" != "0" && "$index" -lt "$total_items" ]]; then
+            sleep "$suite_inter_run_delay"
+        fi
     done
 
     alerts_count="$(wc -l < "$suite_alerts" | tr -d ' ')"
@@ -608,33 +812,26 @@ fi
 
 mkdir -p "$outdir"
 
-find_port() {
-    python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-}
-
 pid_for_vm() {
     pgrep -nf '/VirtualBoxVM.app/.*/VirtualBoxVM .*--startvm' || true
 }
 
 browser_window_id() {
     [[ "$target" == "local" ]] || return 1
-    swift - "$local_browser_app" <<'SWIFT' 2>/dev/null || true
+    swift - "$local_browser_app" "$run_id" <<'SWIFT' 2>/dev/null || true
 import CoreGraphics
 import Foundation
 
-let appName = CommandLine.arguments.dropFirst().first ?? "Google Chrome"
+let args = Array(CommandLine.arguments.dropFirst())
+let appName = args.first ?? "Google Chrome"
+let runId = args.count > 1 ? args[1] : ""
 let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
 let candidates = windows.compactMap { window -> (Int, Int, CGFloat)? in
     let owner = window[kCGWindowOwnerName as String] as? String ?? ""
     guard owner == appName || owner.contains(appName) else { return nil }
     let title = window[kCGWindowName as String] as? String ?? ""
-    guard title.contains("DXMTBench") || title.contains("127.0.0.1") || title.contains("localhost") else { return nil }
+    guard title.contains("DXMTBench") else { return nil }
+    if !runId.isEmpty && !title.contains(runId) { return nil }
     guard let number = window[kCGWindowNumber as String] as? Int else { return nil }
     let layer = window[kCGWindowLayer as String] as? Int ?? 0
     let bounds = window[kCGWindowBounds as String] as? [String: Any] ?? [:]
@@ -674,6 +871,23 @@ if let best = candidates.sorted(by: { $0.1 > $1.1 }).first {
     print(best.0)
 }
 SWIFT
+}
+
+focus_vm_window() {
+    [[ "$target" == "vm" ]] || return 0
+    [[ "$focus_screenshot_window" == "1" ]] || return 0
+    osascript <<'OSA' >/dev/null 2>&1 || true
+tell application "System Events"
+    repeat with proc in application processes
+        set procName to name of proc
+        if procName contains "VirtualBox" then
+            set frontmost of proc to true
+            exit repeat
+        end if
+    end repeat
+end tell
+OSA
+    sleep 0.2
 }
 
 sample_cpu() {
@@ -765,21 +979,36 @@ open_url_in_local_browser() {
     printf 'local_browser_app=%s\n' "$local_browser_app" | tee -a "$outdir/run-config.txt"
     printf 'local_browser_process_pattern=%s\n' "$local_browser_process_pattern" | tee -a "$outdir/run-config.txt"
     before_pids="$(pgrep -f "$local_browser_process_pattern" 2>/dev/null | sort -n | paste -sd, - || true)"
-    if [[ "$local_browser" == "chrome" ]]; then
-        URL="$url" APP_NAME="$local_browser_app" WIDTH="$local_browser_width" HEIGHT="$local_browser_height" \
-            osascript <<'OSA' >"$outdir/local-browser.stdout" 2>"$outdir/local-browser.stderr" || \
-            open -a "$local_browser_app" "$url" >>"$outdir/local-browser.stdout" 2>>"$outdir/local-browser.stderr"
+    if [[ "$local_browser" == "chrome" && "$local_browser_isolated" == "1" ]]; then
+        local chrome_bin profile_dir
+        chrome_bin="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        profile_dir="$outdir/chrome-profile"
+        mkdir -p "$profile_dir"
+        "$chrome_bin" \
+            --user-data-dir="$profile_dir" \
+            --no-first-run \
+            --disable-default-apps \
+            --window-position=80,80 \
+            --window-size="${local_browser_width},${local_browser_height}" \
+            --new-window "$url" \
+            >"$outdir/local-browser.stdout" 2>"$outdir/local-browser.stderr" &
+        local_browser_pid=$!
+        printf 'local_browser_profile=%s\n' "$profile_dir" >> "$outdir/run-config.txt"
+    elif [[ "$local_browser" == "chrome" ]]; then
+        URL="$url" WIDTH="$local_browser_width" HEIGHT="$local_browser_height" \
+            osascript <<'OSA' >"$outdir/local-browser.stdout" 2>"$outdir/local-browser.stderr"
 set benchUrl to system attribute "URL"
-set appName to system attribute "APP_NAME"
 set winWidth to (system attribute "WIDTH") as integer
 set winHeight to (system attribute "HEIGHT") as integer
-tell application appName
+tell application "Google Chrome"
     activate
     if (count of windows) = 0 then
         make new window
     end if
-    set bounds of front window to {80, 80, 80 + winWidth, 80 + winHeight}
-    set URL of active tab of front window to benchUrl
+    set targetWindow to front window
+    set bounds of targetWindow to {80, 80, 80 + winWidth, 80 + winHeight}
+    set targetTabIndex to active tab index of targetWindow
+    set URL of tab targetTabIndex of targetWindow to benchUrl
 end tell
 OSA
     elif [[ -x "$local_browser" ]]; then
@@ -802,10 +1031,11 @@ OSA
 
 local_cleanup_after_run() {
     [[ "$cleanup_browser" == "1" ]] || return 0
-    if [[ -n "${local_browser_pid:-}" ]] && [[ "$local_browser" != "chrome" ]] && kill -0 "$local_browser_pid" >/dev/null 2>&1; then
-        kill "$local_browser_pid" >/dev/null 2>&1 || true
+    if [[ -n "${local_browser_pid:-}" ]] && kill -0 "$local_browser_pid" >/dev/null 2>&1; then
+        descendant_pids "$local_browser_pid" | sort -rn | xargs kill >/dev/null 2>&1 || true
         sleep 1
-        kill -9 "$local_browser_pid" >/dev/null 2>&1 || true
+        descendant_pids "$local_browser_pid" | sort -rn | xargs kill -9 >/dev/null 2>&1 || true
+        return 0
     fi
     if [[ "$local_browser" == "chrome" ]]; then
         open -a "$local_browser_app" "about:blank" >/dev/null 2>&1 || true
@@ -821,7 +1051,13 @@ open_url_in_guest() {
     local mode="${2:-$launch_method}"
     key_scancodes 01 81
     sleep 0.3
-    if [[ "$mode" == "browser" ]]; then
+    if [[ "$mode" == "run" ]]; then
+        local command
+        command="cmd /c start \"\" $guest_browser_exe --user-data-dir=\"$guest_browser_profile\" $guest_browser_flags --new-window \"$url\""
+        key_scancodes e0 5b 13 93 e0 db
+        sleep 0.8
+        "$vboxmanage" controlvm "$vm" keyboardputstring "$command" >/dev/null 2>&1 || true
+    elif [[ "$mode" == "browser" ]]; then
         key_scancodes 1d 26 a6 9d
         sleep 0.3
         "$vboxmanage" controlvm "$vm" keyboardputstring "$url" >/dev/null 2>&1 || true
@@ -834,7 +1070,7 @@ open_url_in_guest() {
         "$vboxmanage" controlvm "$vm" clipboard mode bidirectional >/dev/null 2>&1 || true
         sleep 0.5
         key_scancodes 1d 2f af 9d
-    elif [[ "$mode" != "browser" ]]; then
+    elif [[ "$mode" == "keyboard" ]]; then
         "$vboxmanage" controlvm "$vm" keyboardputstring "$url" >/dev/null 2>&1 || true
     fi
     sleep 0.3
@@ -949,6 +1185,9 @@ else
     url_host="10.0.2.2"
 fi
 run_id="$(date +%Y%m%d-%H%M%S)"
+if [[ -z "$guest_browser_profile" ]]; then
+    guest_browser_profile="%TEMP%\\dxmtbench-$run_id"
+fi
 host_cpus="$(sysctl -n hw.ncpu 2>/dev/null || true)"
 host_memory_mb="$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f", $1 / 1048576}' || true)"
 vm_info_mr=""
@@ -969,8 +1208,10 @@ if [[ "$target" == "vm" ]]; then
     capture_graphics_log_start
 fi
 bench_config_file="$outdir/bench-config.json"
+server_config_file="${server_config_file_override:-$bench_config_file}"
 python3 - "$bench_config_file" \
     run "$run_id" \
+    outdir "$outdir" \
     target "$target" \
     duration "$((duration * 1000))" \
     warmup "$((warmup * 1000))" \
@@ -1006,6 +1247,11 @@ pairs = sys.argv[2:]
 config = {pairs[i]: pairs[i + 1] for i in range(0, len(pairs), 2)}
 path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
+if [[ "$server_config_file" != "$bench_config_file" ]]; then
+    server_config_tmp="${server_config_file}.tmp.$$"
+    cp "$bench_config_file" "$server_config_tmp"
+    mv "$server_config_tmp" "$server_config_file"
+fi
 url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
 
 {
@@ -1016,6 +1262,8 @@ url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
     printf 'url_host=%s\n' "$url_host"
     printf 'url=%s\n' "$url"
     printf 'bench_config_file=%s\n' "$bench_config_file"
+    printf 'server_config_file=%s\n' "$server_config_file"
+    printf 'external_server=%s\n' "$external_server"
     printf 'duration=%ss\n' "$duration"
     printf 'warmup=%ss\n' "$warmup"
     printf 'instances=%s\n' "$instances"
@@ -1039,6 +1287,7 @@ url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
     printf 'midrun_screenshot_delay=%s\n' "$midrun_screenshot_delay"
     printf 'visual_analysis=%s\n' "$visual_analysis"
     printf 'host_window_screenshot=%s\n' "$host_window_screenshot"
+    printf 'focus_screenshot_window=%s\n' "$focus_screenshot_window"
     printf 'cleanup_browser=%s\n' "$cleanup_browser"
     printf 'exit_browser_fullscreen=%s\n' "$exit_browser_fullscreen"
     printf 'show_desktop_after_run=%s\n' "$show_desktop_after_run"
@@ -1054,11 +1303,16 @@ url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
     printf 'vm_3d=%s\n' "$vm_3d"
     printf 'browser_fullscreen=%s\n' "$browser_fullscreen"
     printf 'launch_method=%s\n' "$launch_method"
+    printf 'guest_browser_exe=%s\n' "$guest_browser_exe"
+    printf 'guest_browser_profile=%s\n' "$guest_browser_profile"
+    printf 'guest_browser_flags=%s\n' "$guest_browser_flags"
+    printf 'guest_kill_browser_before_run=%s\n' "$guest_kill_browser_before_run"
     printf 'local_browser=%s\n' "$local_browser"
     printf 'local_browser_app=%s\n' "$local_browser_app"
     printf 'local_browser_process_pattern=%s\n' "$local_browser_process_pattern"
     printf 'local_browser_width=%s\n' "$local_browser_width"
     printf 'local_browser_height=%s\n' "$local_browser_height"
+    printf 'local_browser_isolated=%s\n' "$local_browser_isolated"
     printf 'virtualbox_src=%s\n' "$virtualbox_src"
     printf 'run_start_unix=%s\n' "$run_start_unix"
 } | tee "$outdir/run-config.txt"
@@ -1162,7 +1416,7 @@ capture_run_screenshot() {
         if [[ -n "$window_id" ]]; then
             screencapture -x -l "$window_id" "$path" >/dev/null 2>&1 || true
         else
-            screencapture -x "$path" >/dev/null 2>&1 || true
+            printf 'screenshot_skipped=%s reason=local_benchmark_window_not_found\n' "$path" >> "$outdir/run-config.txt"
         fi
     fi
 }
@@ -1173,6 +1427,7 @@ capture_host_window_screenshot() {
     [[ "$host_window_screenshot" == "1" ]] || return 0
 
     local window_id
+    focus_vm_window
     window_id="$(vm_window_id | head -n 1)"
     if [[ -n "$window_id" ]]; then
         screencapture -x -l "$window_id" "$path" >/dev/null 2>&1 || true
@@ -1200,6 +1455,41 @@ except Exception as exc:
     summary_json.write_text(json.dumps({"available": False, "reason": str(exc)}, indent=2) + "\n", encoding="utf-8")
     raise SystemExit(0)
 
+def fnv1a32(text):
+    h = 0x811c9dc5
+    for ch in text:
+        h ^= ord(ch)
+        h = (h * 0x01000193) & 0xffffffff
+    return h
+
+def signature_colors(workload, run):
+    h = fnv1a32(f"{workload}|{run}")
+    colors = []
+    for _ in range(4):
+        h ^= (h << 13) & 0xffffffff
+        h &= 0xffffffff
+        h ^= h >> 17
+        h &= 0xffffffff
+        h ^= (h << 5) & 0xffffffff
+        h &= 0xffffffff
+        r = 56 + ((h >> 0) & 0xbf)
+        g = 56 + ((h >> 8) & 0xbf)
+        b = 56 + ((h >> 16) & 0xbf)
+        if max(r, g, b) - min(r, g, b) < 72:
+            r = (r + 112) & 0xff
+        colors.append((r, g, b))
+    return colors
+
+expected_signature = []
+config_path = outdir / "bench-config.json"
+if config_path.exists():
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8", errors="replace"))
+        if cfg.get("workload") and cfg.get("run"):
+            expected_signature = signature_colors(str(cfg["workload"]), str(cfg["run"]))
+    except Exception:
+        expected_signature = []
+
 def luma(rgb):
     return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
 
@@ -1218,6 +1508,8 @@ def classify(mean_luma, std_luma, white_ratio, black_ratio, gray_ratio):
         return "mostly-black"
     if gray_ratio >= 0.72 and std_luma < 22:
         return "mostly-gray"
+    if mean_luma < 20 and std_luma < 25:
+        return "low-contrast-black"
     if std_luma < 6:
         if mean_luma < 28:
             return "blank-black"
@@ -1269,8 +1561,40 @@ def content_region(img):
     if w >= 1000 and h >= 700:
         left = min(max(700, w // 3), max(w - 1, 0))
         top = min(max(380, h // 3), max(h - 1, 0))
-        return img.crop((left, top, w, h))
+        right = max(left + 1, w - max(40, w // 32))
+        bottom = max(top + 1, h - max(320, h // 4))
+        return img.crop((left, top, right, bottom))
     return img.crop((w // 4, h // 4, max(w // 4 + 1, 3 * w // 4), max(h // 4 + 1, 3 * h // 4)))
+
+def signature_for(img):
+    if not expected_signature:
+        return {"available": False}
+    w, h = img.size
+    region = img.crop((
+        max(0, w - max(520, w // 3)),
+        max(0, h - max(360, h // 3)),
+        w,
+        h,
+    ))
+    sample = region.copy()
+    sample.thumbnail((1280, 1280))
+    counts = [0 for _ in expected_signature]
+    max_distance_sq = 72 * 72
+    pixels = sample.get_flattened_data() if hasattr(sample, "get_flattened_data") else sample.getdata()
+    for r, g, b in pixels:
+        for i, (er, eg, eb) in enumerate(expected_signature):
+            if (r - er) * (r - er) + (g - eg) * (g - eg) + (b - eb) * (b - eb) <= max_distance_sq:
+                counts[i] += 1
+    min_count = 180
+    hits = sum(1 for count in counts if count >= min_count)
+    return {
+        "available": True,
+        "present": hits >= 3,
+        "hits": hits,
+        "total": len(expected_signature),
+        "counts": counts,
+        "expected": [list(color) for color in expected_signature],
+    }
 
 entries = []
 for name in (
@@ -1298,6 +1622,7 @@ for name in (
         "height": img.height,
         "full": stats_for(img),
         "content": stats_for(region),
+        "signature": signature_for(img),
     })
 
 if not entries:
@@ -1315,8 +1640,19 @@ for entry in entries:
     key = entry["file"].removesuffix(".png").replace("-", "_")
     content = entry["content"]
     full = entry["full"]
+    signature = entry.get("signature", {})
+    signature_text = ""
+    if signature.get("available"):
+        signature_state = "present" if signature.get("present") else "absent"
+        counts = ",".join(str(v) for v in signature.get("counts", []))
+        signature_text = " signature=%s signature_hits=%s/%s signature_counts=%s" % (
+            signature_state,
+            signature.get("hits", 0),
+            signature.get("total", 0),
+            counts,
+        )
     lines.append(
-        "visual_%s=%s %sx%s content_luma=%.2f content_std=%.2f full=%s" % (
+        "visual_%s=%s %sx%s content_luma=%.2f content_std=%.2f full=%s%s" % (
             key,
             content["classification"],
             entry["width"],
@@ -1324,6 +1660,7 @@ for entry in entries:
             content["mean_luma"],
             content["stddev_luma"],
             full["classification"],
+            signature_text,
         )
     )
 
@@ -1338,19 +1675,32 @@ for stage in ("before", "measure-mid", "after", "no-measure-start"):
             continue
         key = stage.replace("-", "_")
         content = entry["content"]
+        signature = entry.get("signature", {})
+        signature_state = None
+        if signature.get("available"):
+            signature_state = "present" if signature.get("present") else "absent"
         primary[key] = {
             "source": name,
             "classification": content["classification"],
             "meanLuma": content["mean_luma"],
             "stddevLuma": content["stddev_luma"],
+            "signature": signature_state,
         }
+        signature_text = ""
+        if signature_state:
+            signature_text = " signature=%s signature_hits=%s/%s" % (
+                signature_state,
+                signature.get("hits", 0),
+                signature.get("total", 0),
+            )
         lines.append(
-            "visual_primary_%s=%s source=%s content_luma=%.2f content_std=%.2f" % (
+            "visual_primary_%s=%s source=%s content_luma=%.2f content_std=%.2f%s" % (
                 key,
                 content["classification"],
                 name,
                 content["mean_luma"],
                 content["stddev_luma"],
+                signature_text,
             )
         )
         break
@@ -1377,21 +1727,28 @@ if [[ "$target" == "vm" ]]; then
         | tee "$outdir/vminfo-before.txt"
 fi
 
-python3 "$server_py" --bind "$server_bind" --port "$port" --root "$script_dir" --html "$html" --outdir "$outdir" --config "$bench_config_file" >"$outdir/server.stdout" 2>"$outdir/server.stderr" &
-server_pid=$!
-cleanup() {
-    kill "$server_pid" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
+server_pid=""
+if [[ "$external_server" != "1" ]]; then
+    python3 "$server_py" --bind "$server_bind" --port "$port" --root "$script_dir" --html "$html" --outdir "$outdir" --config "$server_config_file" >"$outdir/server.stdout" 2>"$outdir/server.stderr" &
+    server_pid=$!
+    cleanup() {
+        kill "$server_pid" >/dev/null 2>&1 || true
+    }
+    trap cleanup EXIT
 
-for _ in {1..20}; do
-    [[ -s "$outdir/server-ready.txt" ]] && break
-    sleep 0.25
-done
+    for _ in {1..20}; do
+        [[ -s "$outdir/server-ready.txt" ]] && break
+        sleep 0.25
+    done
+fi
 
 if [[ "$target" == "vm" ]]; then
     "$vboxmanage" controlvm "$vm" screenshotpng "$outdir/before.png" >/dev/null 2>&1 || true
     capture_host_window_screenshot "$outdir/host-before.png"
+    if [[ "$guest_kill_browser_before_run" == "1" ]]; then
+        open_url_in_guest "cmd /c taskkill /IM msedge.exe /F >NUL 2>&1" "keyboard"
+        sleep 1
+    fi
     open_url_in_guest "$url"
 else
     open_url_in_local_browser "$url"
@@ -1402,15 +1759,19 @@ fi
 
 if ! wait_for_event "script-start" 10; then
     if [[ "$target" == "vm" ]]; then
-        echo "script-start event not observed after initial launch; retrying through browser address bar" | tee -a "$outdir/summary.txt"
-        open_url_in_guest "$url" browser
+        retry_method="browser"
+        if [[ "$launch_method" == "browser" ]]; then
+            retry_method="keyboard"
+        fi
+        echo "script-start event not observed after initial launch; retrying through $retry_method launch" | tee -a "$outdir/summary.txt"
+        open_url_in_guest "$url" "$retry_method"
     else
         echo "script-start event not observed after local browser launch" | tee -a "$outdir/summary.txt"
     fi
 fi
 
 if ! wait_for_event "measure-start" 45; then
-    echo "measure-start event not observed; collecting diagnostic screenshot and exiting" | tee "$outdir/summary.txt"
+    echo "measure-start event not observed; collecting diagnostic screenshot and exiting" | tee -a "$outdir/summary.txt"
     if [[ "$target" == "vm" ]]; then
         capture_crash_diagnostics "measure-start-timeout"
         if "$vboxmanage" showvminfo "$vm" --machinereadable 2>/dev/null | rg -q '^VMState="running"'; then
@@ -1453,7 +1814,9 @@ else
     sample_pid=""
     printf 'sample skipped: no pid\n' > "$outdir/sample.err"
 fi
-if [[ "$target" == "local" ]]; then
+if [[ "$target" == "local" && -n "$pid" ]]; then
+    sample_cpu_tree "$sample_seconds" "$outdir/active.cpu" "$pid" &
+elif [[ "$target" == "local" ]]; then
     sample_cpu_matching "$sample_seconds" "$outdir/active.cpu" "$local_browser_process_pattern" &
 else
     sample_cpu "$sample_seconds" "$outdir/active.cpu" "$pid" &

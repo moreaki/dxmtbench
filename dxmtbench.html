@@ -31,6 +31,28 @@ canvas {
     border-radius: 6px;
     backdrop-filter: blur(8px);
 }
+#signature {
+    position: fixed;
+    right: 24px;
+    bottom: 24px;
+    display: grid;
+    grid-template-columns: repeat(4, 56px);
+    gap: 10px;
+    padding: 10px;
+    background: rgba(5, 7, 10, 0.60);
+    border: 1px solid rgba(255, 255, 255, 0.20);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    pointer-events: none;
+}
+.signature-cell {
+    width: 56px;
+    height: 56px;
+    border: 3px solid rgba(255, 255, 255, 0.92);
+    box-shadow:
+        inset 0 0 0 3px rgba(0, 0, 0, 0.78),
+        0 0 0 1px rgba(0, 0, 0, 0.92);
+}
 #hud h1 {
     margin: 0 0 8px;
     font-size: 15px;
@@ -66,6 +88,7 @@ canvas {
     <h1>DXMTBench WebGL Throughput Benchmark</h1>
     <div class="grid" id="metrics"></div>
 </div>
+<div id="signature" aria-hidden="true"></div>
 <script>
 "use strict";
 
@@ -90,6 +113,7 @@ const requestedDpr = readParam("dpr", "auto");
 const workloadName = readParam("workload", "cubes-fill");
 const workloadNeedsStencil = workloadName.includes("stencil");
 const runId = readParam("run", new Date().toISOString());
+document.title = `DXMTBench ${workloadName} ${runId}`;
 const shaderIters = Math.max(1, Number(readParam("shaderIters", "64")));
 const textureSize = Math.max(16, Number(readParam("textureSize", "1024")));
 const vertexCount = Math.max(256, Number(readParam("vertices", String(Math.max(65536, instances * 128)))));
@@ -119,6 +143,7 @@ const vmInfo = {
 };
 const canvas = document.getElementById("gl");
 const metrics = document.getElementById("metrics");
+const signature = document.getElementById("signature");
 const gl = canvas.getContext("webgl2", {
     alpha: false,
     antialias: false,
@@ -175,6 +200,52 @@ const state = {
     lastSize: null,
     contextReleased: false
 };
+
+function fnv1a32(text) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < text.length; ++i) {
+        h ^= text.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return h >>> 0;
+}
+
+function signatureColors(workload, run) {
+    let h = fnv1a32(`${workload}|${run}`);
+    const colors = [];
+    for (let i = 0; i < 4; ++i) {
+        h ^= h << 13; h >>>= 0;
+        h ^= h >>> 17; h >>>= 0;
+        h ^= h << 5; h >>>= 0;
+        const channel = (shift) => 56 + ((h >>> shift) & 0xbf);
+        let r = channel(0);
+        let g = channel(8);
+        let b = channel(16);
+        if (Math.max(r, g, b) - Math.min(r, g, b) < 72)
+            r = (r + 112) & 0xff;
+        colors.push([r, g, b]);
+    }
+    return colors;
+}
+
+const visualSignature = {
+    seed: `${workloadName}|${runId}`,
+    colors: signatureColors(workloadName, runId)
+};
+
+function installVisualSignature() {
+    signature.textContent = "";
+    signature.dataset.colors = visualSignature.colors.map(color => color.join(",")).join(";");
+    for (const color of visualSignature.colors) {
+        const cell = document.createElement("div");
+        cell.className = "signature-cell";
+        cell.style.backgroundColor = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+        signature.appendChild(cell);
+    }
+}
+
+installVisualSignature();
+config.visualSignature = visualSignature;
 
 function emitEvent(event, extra = {}) {
     fetch("/event", {
@@ -653,9 +724,14 @@ out vec4 color;
 void main() {
     vec2 p = vUv * 2.0 - 1.0;
     float v = sin(28.0 * length(p) - uTime * 2.5) * 0.5 + 0.5;
+    float checker = mod(floor(vUv.x * 22.0) + floor(vUv.y * 14.0), 2.0);
+    float stripe = 0.5 + 0.5 * sin((vUv.x - vUv.y) * 54.0 + uTime * 0.9);
     vec3 a = vec3(0.04, 0.09, 0.13);
     vec3 b = vec3(0.10 + 0.30 * vUv.x, 0.24 + 0.40 * vUv.y, 0.48 + 0.18 * v);
-    color = vec4(mix(a, b, 0.82), 1.0);
+    vec3 c = mix(a, b, 0.78);
+    c = mix(c, c + vec3(0.16, 0.07, 0.22), 0.22 * checker);
+    c += vec3(0.07, 0.11, 0.05) * stripe;
+    color = vec4(min(c, vec3(1.0)), 1.0);
 }`);
     const vao = gl.createVertexArray();
     const uTime = gl.getUniformLocation(prog, "uTime");
@@ -1643,6 +1719,7 @@ function finish() {
         gpuTimer,
         estimated,
         throughput,
+        visualSignature,
         canvas: {
             width: canvas.width,
             height: canvas.height,

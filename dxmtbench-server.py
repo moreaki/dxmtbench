@@ -41,6 +41,10 @@ class BenchmarkHandler(http.server.SimpleHTTPRequestHandler):
             except Exception as exc:
                 self.send_error(500, "invalid benchmark config: %s" % exc)
                 return
+        run_id = str(config.get("run") or "")
+        run_outdir = str(config.get("outdir") or "")
+        if run_id and run_outdir:
+            self.server.run_dirs[run_id] = pathlib.Path(run_outdir).resolve()
 
         html = self.server.benchmark_html.read_text(encoding="utf-8")
         injection = "<script>window.DXMTBENCH_CONFIG = %s;</script>\n" % json.dumps(config, separators=(",", ":"))
@@ -69,16 +73,21 @@ class BenchmarkHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         payload["_hostReceiveUnix"] = time.time()
+        run_id = str(payload.get("runId") or "")
+        outdir = self.server.run_dirs.get(run_id, self.server.outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        events_file = outdir / "browser-events.jsonl"
+        result_file = outdir / "browser-result.json"
         if self.path == "/event":
-            with self.server.events_file.open("a", encoding="utf-8") as fh:
+            with events_file.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(payload, sort_keys=True) + "\n")
             self.send_response(204)
             self.end_headers()
             return
 
         if self.path == "/result":
-            self.server.result_file.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            with self.server.events_file.open("a", encoding="utf-8") as fh:
+            result_file.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            with events_file.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"event": "result", "_hostReceiveUnix": time.time()}, sort_keys=True) + "\n")
             self.send_response(204)
             self.end_headers()
@@ -113,8 +122,8 @@ def main():
     with ThreadedTCPServer((args.bind, args.port), handler) as server:
         server.benchmark_html = html
         server.config_file = pathlib.Path(args.config).resolve() if args.config else None
-        server.events_file = outdir / "browser-events.jsonl"
-        server.result_file = outdir / "browser-result.json"
+        server.outdir = outdir
+        server.run_dirs = {}
         server.log_file = outdir / "http-server.log"
         (outdir / "server-ready.txt").write_text("%s:%s\n" % (args.bind, args.port), encoding="utf-8")
         print("serving %s on %s:%s" % (html, args.bind, args.port), flush=True)

@@ -118,15 +118,29 @@ With `TARGET=vm`, the runner uses `VBoxManage` to open the URL in the guest, cap
 VM screenshots, gather selected VM state, collect VMSVGA statistics, and scan the VM
 log for known graphics-alert patterns.
 
+VM browser navigation defaults to opening the URL through the Windows Run dialog.
+That avoids depending on a focused Edge tab and proved more reliable for repeated
+automated suite runs. The older address-bar reuse path is still available with
+`LAUNCH_METHOD=browser` for manual debugging.
+
 With `TARGET=local`, the runner opens the URL in local Chrome and skips the VM-only
-probes. By default it uses the normal Chrome profile/session and does not close Chrome
-after the run. This avoids creating a second browser profile, but it also means CPU
-sampling covers the matching Chrome process group rather than a fully isolated browser
-instance. Local screenshots are captured from the Chrome benchmark window, not from
-the whole desktop, so the local target is also useful as a visual correctness gate.
+probes. By default it launches Chrome with a disposable `--user-data-dir` inside the
+run artifact directory and closes that process tree after the run. This avoids
+contaminating screenshots with the user's existing tabs and keeps CPU sampling scoped
+to the benchmark browser. Set `LOCAL_BROWSER_ISOLATED=0 CLEANUP_BROWSER=0` to reuse
+the normal Chrome session during manual debugging. Local screenshots are captured from
+the current benchmark window, not from the whole desktop, so the local target is also
+useful as a visual correctness gate.
 
 For suites, the runner executes several workloads and writes aggregate TSV/JSONL files
 so we can compare patched and baseline builds with minimal manual work.
+
+VM suites default to one persistent host HTTP server and one stable port for the whole
+suite. Each workload still gets its own output directory; the server routes
+`/event` and `/result` posts by `runId`. This avoids interpreting a guest networking
+or repeated-navigation failure as a rendering result. It also keeps the completed
+browser window visible between runs by default, so the user can see the last rendered
+scene instead of a hidden tab, a desktop transition, or a forcibly closed browser.
 
 ## Workload Families
 
@@ -235,6 +249,29 @@ Common controls:
 - `HOST_WINDOW_SCREENSHOT`: defaults to `1` for VM runs; captures the actual macOS
   VirtualBoxVM window in addition to the guest framebuffer. This catches host
   presentation failures that `VBoxManage screenshotpng` cannot see.
+- `FOCUS_SCREENSHOT_WINDOW`: defaults to `1` for VM host-window screenshots. The
+  runner brings the VirtualBox window forward before capturing it so `screencapture`
+  does not read a stale background-window backing store.
+- `LAUNCH_METHOD`: defaults to `keyboard` for VM runs. This opens the benchmark URL
+  through the Windows Run dialog and avoids relying on a focused browser address bar.
+  Set `LAUNCH_METHOD=browser` to reuse the active browser tab during manual debugging.
+- `BROWSER_FULLSCREEN`: defaults to `0`. Fullscreen toggling is opt-in because it can
+  make repeated automated suite runs harder to correlate with the visible tab.
+- `CLEANUP_BROWSER`: defaults to `0` for VM runs and normal local Chrome sessions;
+  defaults to `1` only for isolated local Chrome runs.
+- `SUITE_PERSISTENT_SERVER`: defaults to `1` for VM suites; one host server and one
+  port are reused for all workloads while per-run events are still routed into the
+  correct workload directory.
+- `SUITE_INTER_RUN_DELAY`: defaults to `3` seconds for VM suites and `0` for local
+  suites. The delay leaves a short visible pause after each workload and reduces
+  repeated-navigation churn in the guest browser.
+- `SUITE_RESET_VM_BETWEEN_RUNS`: defaults to `0`. Set to `1` when comparing branches
+  that make the guest browser, NAT path, or VirtualBox display output unstable across
+  repeated automated navigations. The runner resets the VM and waits for Guest
+  Additions before every workload, which is slower but gives isolated visual evidence
+  per workload.
+- `SUITE_RESET_SETTLE_SECONDS`: defaults to `5`; extra wait after reset isolation sees
+  Guest Additions and a real `10.0.2.x` NAT lease.
 
 Workload intensity controls:
 
@@ -260,12 +297,14 @@ Local browser controls:
 - `LOCAL_BROWSER_APP`: macOS application name used by `open`; default is
   `Google Chrome`.
 - `LOCAL_BROWSER_WIDTH` and `LOCAL_BROWSER_HEIGHT`: requested local Chrome window
-  size. The runner reuses the normal Chrome session and navigates the active tab in
-  the front window.
+  size.
+- `LOCAL_BROWSER_ISOLATED`: defaults to `1`; launches Chrome with a disposable
+  run-local user-data directory. Set to `0` to navigate the active tab in the normal
+  Chrome session.
 - `LOCAL_BROWSER_PROCESS_PATTERN`: process pattern used for local CPU sampling;
   default is `Google Chrome`.
-- `CLEANUP_BROWSER`: defaults to `0` for `TARGET=local` so the runner does not close
-  or disrupt the user's normal Chrome session.
+- `CLEANUP_BROWSER`: defaults to `1` for isolated local Chrome and `0` for the normal
+  Chrome session.
 
 ## Heavy Versus Hazardous
 
@@ -357,10 +396,22 @@ but the VM run is black, white, gray, stale, or missing the expected scene in th
 primary VM screenshot, investigate the VirtualBox guest, device, DXMT, or host
 presentation path for that branch.
 
+VM runs can also fail before the benchmark page starts. Those are not graphics
+throughput results. The suite reports these separately as transport/page-load alerts,
+for example `transport-no-script-start` when Edge navigates to `10.0.2.2` but the host
+server sees no `GET`. In that case, inspect the screenshot and `http-server.log`
+before comparing FPS or visual output. For long VM comparisons, prefer a fixed suite
+port such as `SUITE_PORT=53337` and split very long suites if Edge or the VirtualBox
+NAT path becomes unstable after repeated automated navigations.
+
 The mid-run screenshot is the primary visual signal. Some workloads release or idle
 their WebGL context after measurement, so `after.png` is useful but should not replace
 `measure-mid.png` when deciding whether a benchmark actually rendered during the
 measured interval.
+
+The visual classifier crops away the HUD and surrounding browser/window chrome before
+classifying the screenshot. This is intentionally strict: a readable HUD, address bar,
+Windows taskbar, or stale browser tab is not enough to pass the visual gate.
 
 ## Measurement Model
 
