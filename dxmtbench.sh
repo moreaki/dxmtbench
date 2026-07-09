@@ -61,6 +61,7 @@ chunk_ms="${CHUNK_MS:-25}"
 finish_each_frame="${FINISH:-0}"
 sync_every="${SYNC_EVERY:-0}"
 browser_fullscreen="${BROWSER_FULLSCREEN:-0}"
+guest_browser_maximize="${GUEST_BROWSER_MAXIMIZE:-1}"
 if [[ -n "${LAUNCH_METHOD:-}" ]]; then
     launch_method="$LAUNCH_METHOD"
 elif [[ "$target" == "vm" ]]; then
@@ -1046,6 +1047,15 @@ key_scancodes() {
     "$vboxmanage" controlvm "$vm" keyboardputscancode "$@" >/dev/null 2>&1 || true
 }
 
+maximize_guest_browser_window() {
+    [[ "$guest_browser_maximize" == "1" ]] || return 0
+    [[ "$browser_fullscreen" == "1" ]] && return 0
+
+    # Win+Up maximizes the active browser window without entering browser fullscreen.
+    key_scancodes e0 5b e0 48 e0 c8 e0 db
+    sleep 0.8
+}
+
 open_url_in_guest() {
     local url="$1"
     local mode="${2:-$launch_method}"
@@ -1076,6 +1086,7 @@ open_url_in_guest() {
     sleep 0.3
     key_scancodes 1c 9c
     sleep 5.0
+    maximize_guest_browser_window
     if [[ "$browser_fullscreen" == "1" ]]; then
         key_scancodes 57 d7
     fi
@@ -1302,6 +1313,7 @@ url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
     printf 'vm_graphics=%s\n' "$vm_graphics"
     printf 'vm_3d=%s\n' "$vm_3d"
     printf 'browser_fullscreen=%s\n' "$browser_fullscreen"
+    printf 'guest_browser_maximize=%s\n' "$guest_browser_maximize"
     printf 'launch_method=%s\n' "$launch_method"
     printf 'guest_browser_exe=%s\n' "$guest_browser_exe"
     printf 'guest_browser_profile=%s\n' "$guest_browser_profile"

@@ -235,6 +235,8 @@ Common controls:
 - `WARMUP`: warmup time before measurement.
 - `DPR`: device pixel ratio override, or `auto`.
 - `MAX_CANVAS_PIXELS`: canvas pixel cap. This defaults to a safer capped value.
+  Raise it for explicit 4K or Retina throughput runs; for example,
+  `MAX_CANVAS_PIXELS=12000000` allows a 3840x2160-class render target.
 - `OUTROOT`: parent directory for benchmark artifacts.
 - `BASELINE`: previous `suite-results.jsonl` used for comparisons.
 - `VIRTUALBOX_SRC`: optional VirtualBox source checkout used only to record the tested
@@ -255,6 +257,10 @@ Common controls:
 - `LAUNCH_METHOD`: defaults to `keyboard` for VM runs. This opens the benchmark URL
   through the Windows Run dialog and avoids relying on a focused browser address bar.
   Set `LAUNCH_METHOD=browser` to reuse the active browser tab during manual debugging.
+- `GUEST_BROWSER_MAXIMIZE`: defaults to `1` for VM runs. After opening the benchmark
+  URL, the runner sends a normal Windows maximize gesture to the active browser window
+  so high-resolution guest modes actually enlarge the WebGL render target. This is
+  separate from browser fullscreen.
 - `BROWSER_FULLSCREEN`: defaults to `0`. Fullscreen toggling is opt-in because it can
   make repeated automated suite runs harder to correlate with the visible tab.
 - `CLEANUP_BROWSER`: defaults to `0` for VM runs and normal local Chrome sessions;
