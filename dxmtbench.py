@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import json
 import hashlib
+import io
+import itertools
 import math
 import pathlib
 import shutil
@@ -9,6 +11,19 @@ import subprocess
 import sys
 import time
 from csv import DictReader
+
+
+SUITE_TSV_COLUMNS = (
+    "workload", "status", "mode", "sync_every", "fps_avg", "frame_ms_p95",
+    "gpu_timer_usable", "gpu_ms_p95", "gpu_samples", "active_cpu_avg", "canvas",
+    "framebuffer_probe_ok", "visual_primary_measure_mid", "visual_primary_signature",
+    "baseline_eligible", "alert_count", "draws_per_frame", "vertices_per_frame",
+    "triangles_per_frame", "pixels_per_frame", "stencil_pixels_per_frame",
+    "texture_samples_per_frame", "fb_binds_per_frame", "state_changes_per_frame",
+    "estimated_mib_per_second", "fb_write_mib_per_second", "texture_mib_per_second",
+    "clear_mib_per_second", "render_target_mib_per_second", "stencil_mib_per_second",
+    "upload_mib_per_second", "outdir",
+)
 
 
 def emit_event(events, latest, event):
@@ -91,6 +106,10 @@ def cmd_suite_start(args):
     })
 
 
+def cmd_suite_header(_args):
+    print("\t".join(SUITE_TSV_COLUMNS))
+
+
 def cmd_suite_workload_start(args):
     events, latest, root, workload, index, total, outdir = args
     emit_event(events, latest, {
@@ -112,6 +131,52 @@ def parse_float(value):
         return None
 
 
+def framebuffer_probe_coverage_ratio(probe, ratio_key, sample_key):
+    ratio = parse_float(probe.get(ratio_key))
+    if ratio is not None and math.isfinite(ratio) and 0.0 <= ratio <= 1.0:
+        return ratio
+
+    sample_count = parse_float(probe.get("sampleCount"))
+    covered_samples = parse_float(probe.get(sample_key))
+    if (
+        sample_count is None
+        or covered_samples is None
+        or not math.isfinite(sample_count)
+        or not math.isfinite(covered_samples)
+        or sample_count <= 0
+        or covered_samples < 0
+        or covered_samples > sample_count
+    ):
+        return None
+    return covered_samples / sample_count
+
+
+def framebuffer_probe_valid(probe):
+    if not isinstance(probe, dict):
+        return False
+
+    chromatic_ratio = framebuffer_probe_coverage_ratio(
+        probe, "chromaticRatio", "chromaticSamples"
+    )
+    non_dominant_ratio = framebuffer_probe_coverage_ratio(
+        probe, "nonDominantRatio", "nonDominantSamples"
+    )
+    return (
+        probe.get("ok") is True
+        and probe.get("nonUniform") is True
+        and chromatic_ratio is not None
+        and chromatic_ratio >= 0.005
+        and non_dominant_ratio is not None
+        and non_dominant_ratio >= 0.005
+        and not bool(probe.get("errors"))
+        and probe.get("errorsBefore") == []
+        and probe.get("errorsAfter") == []
+        and not bool(probe.get("contextLost"))
+        and probe.get("contextLostBefore") is False
+        and probe.get("contextLostAfter") is False
+    )
+
+
 def load_baseline(path_s):
     if not path_s:
         return {}
@@ -127,6 +192,15 @@ def load_baseline(path_s):
     if path.suffix == ".tsv":
         with path.open(encoding="utf-8") as fh:
             for row in DictReader(fh, delimiter="\t"):
+                if (
+                    row.get("status") != "ok"
+                    or row.get("framebuffer_probe_ok") != "1"
+                    or row.get("visual_primary_measure_mid") != "visible-varied"
+                    or row.get("visual_primary_signature") != "present"
+                    or row.get("baseline_eligible") != "1"
+                    or row.get("alert_count") != "0"
+                ):
+                    continue
                 name = row.get("workload")
                 if name:
                     out[name] = {
@@ -143,9 +217,27 @@ def load_baseline(path_s):
                 item = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") != "ok" or item.get("alerts"):
+                continue
             name = item.get("workload")
-            metrics = item.get("metrics") or {}
-            res = item.get("result") or {}
+            metrics = item.get("metrics")
+            res = item.get("result")
+            if not isinstance(metrics, dict):
+                continue
+            if not isinstance(res, dict):
+                res = {}
+            probes = (
+                metrics.get("framebufferProbe"),
+                res.get("framebufferProbe"),
+            )
+            if (
+                not any(framebuffer_probe_valid(probe) for probe in probes)
+                or metrics.get("visualPrimaryMeasureMid") != "visible-varied"
+                or metrics.get("visualPrimaryMeasureMidSignature") != "present"
+            ):
+                continue
             if name:
                 out[name] = {
                     "fpsAvg": parse_float(metrics.get("fpsAvg", res.get("fpsAvg"))),
@@ -189,6 +281,185 @@ def load_visual_primary(path):
     return values
 
 
+def assess_visual_primary(path, required=False):
+    outdir = pathlib.Path(path)
+    visual_primary = load_visual_primary(outdir)
+    visual_mid = visual_primary.get("measure_mid", {})
+    classification = visual_mid.get("classification")
+    signature = visual_mid.get("signature")
+    source = visual_mid.get("source")
+    alerts = []
+
+    if not required and not (outdir / "visual-summary.txt").exists():
+        return alerts, visual_mid
+    if not classification:
+        alerts.append({
+            "kind": "visual-primary-missing",
+            "metric": "measure-mid",
+            "message": "primary mid-run screenshot was not available",
+        })
+    elif classification != "visible-varied":
+        alerts.append({
+            "kind": "visual-primary",
+            "metric": "measure-mid",
+            "actual": classification,
+            "source": source,
+            "message": "primary mid-run screenshot did not show varied graphical output",
+        })
+    if signature != "present":
+        alerts.append({
+            "kind": "visual-primary-signature",
+            "metric": "measure-mid",
+            "actual": signature or "missing",
+            "source": source,
+            "message": "primary mid-run screenshot did not contain the current workload/run visual signature",
+        })
+    return alerts, visual_mid
+
+
+def assess_framebuffer_probe(result):
+    probe = result.get("framebufferProbe") if isinstance(result, dict) else None
+    if not isinstance(probe, dict):
+        return [{
+            "kind": "framebuffer-probe-missing",
+            "metric": "framebufferProbe",
+            "message": "browser result did not include a framebuffer correctness probe",
+        }]
+    if not framebuffer_probe_valid(probe):
+        return [{
+            "kind": "framebuffer-probe",
+            "metric": "framebufferProbe",
+            "actual": probe.get("classification") or probe.get("reason") or "invalid",
+            "message": "browser-side framebuffer probe did not show varied graphical output",
+        }]
+    return []
+
+
+def validate_run_artifacts(path, require_visual=True):
+    outdir = pathlib.Path(path)
+    errors = []
+    expected_run_id = None
+    artifact_config = {}
+    config_path = outdir / "bench-config.json"
+    if config_path.exists():
+        try:
+            artifact_config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append({"kind": "bench-config-invalid", "message": str(exc)})
+        else:
+            expected_run_id = str(artifact_config.get("run") or "")
+            if not expected_run_id:
+                errors.append({
+                    "kind": "bench-config-run-missing",
+                    "message": "bench-config.json did not identify the current run",
+                })
+    conflict_path = outdir / "terminal-result-conflicts.jsonl"
+    if conflict_path.exists() and conflict_path.stat().st_size > 0:
+        errors.append({
+            "kind": "terminal-result-conflict",
+            "message": "more than one terminal result was posted for this run",
+        })
+    result_path = outdir / "browser-result.json"
+    result = {}
+    if not result_path.exists():
+        errors.append({"kind": "browser-result-missing", "message": "browser-result.json was not created"})
+    else:
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append({"kind": "browser-result-invalid", "message": str(exc)})
+        else:
+            if expected_run_id and str(result.get("runId") or "") != expected_run_id:
+                errors.append({
+                    "kind": "browser-result-run-mismatch",
+                    "message": (
+                        "browser-result.json belongs to run %r, expected %r"
+                        % (result.get("runId"), expected_run_id)
+                    ),
+                })
+            terminal_status = result.get("terminalStatus")
+            if terminal_status != "ok":
+                errors.append({
+                    "kind": "browser-terminal-status",
+                    "message": "browser result terminal status was %r, expected 'ok'" % terminal_status,
+                })
+            if result.get("error"):
+                errors.append({"kind": "browser-error", "message": str(result["error"])})
+            if terminal_status == "ok" and not result.get("error"):
+                errors.extend(assess_framebuffer_probe(result))
+                frames = parse_float(result.get("frames"))
+                fps = parse_float(result.get("fpsAvg"))
+                if frames is None or frames <= 0 or fps is None or fps <= 0:
+                    errors.append({
+                        "kind": "measurement-empty",
+                        "message": "browser result did not contain positive measured frames and FPS",
+                    })
+                config = result.get("config")
+                if not isinstance(config, dict):
+                    errors.append({
+                        "kind": "browser-config-missing",
+                        "message": "browser result did not include its effective configuration",
+                    })
+                    config = {}
+                for key in ("expectedCanvasWidth", "expectedCanvasHeight"):
+                    if key not in artifact_config:
+                        continue
+                    authoritative = parse_float(artifact_config.get(key))
+                    echoed = parse_float(config.get(key))
+                    if authoritative is None or echoed != authoritative:
+                        errors.append({
+                            "kind": "browser-config-mismatch",
+                            "message": (
+                                f"browser config {key}={config.get(key)!r} did not match "
+                                f"bench-config.json value {artifact_config.get(key)!r}"
+                            ),
+                        })
+                canvas = result.get("canvas") or {}
+                expected_width = parse_float(
+                    artifact_config.get("expectedCanvasWidth", config.get("expectedCanvasWidth"))
+                ) or 0
+                expected_height = parse_float(
+                    artifact_config.get("expectedCanvasHeight", config.get("expectedCanvasHeight"))
+                ) or 0
+                actual_width = parse_float(canvas.get("width")) or 0
+                actual_height = parse_float(canvas.get("height")) or 0
+                if actual_width < expected_width or actual_height < expected_height:
+                    errors.append({
+                        "kind": "canvas-size",
+                        "message": (
+                            f"canvas {actual_width:.0f}x{actual_height:.0f} was below required "
+                            f"{expected_width:.0f}x{expected_height:.0f}"
+                        ),
+                    })
+    if require_visual:
+        visual_errors, _visual_mid = assess_visual_primary(outdir, required=True)
+        errors.extend(visual_errors)
+    return errors, result
+
+
+def cmd_validate_run(args):
+    outdir = pathlib.Path(args[0])
+    require_visual = len(args) < 2 or args[1] == "1"
+    errors, result = validate_run_artifacts(outdir, require_visual=require_visual)
+    probe = result.get("framebufferProbe", {}) if isinstance(result, dict) else {}
+    if errors:
+        print(f"functional_validation=failed errors={len(errors)}")
+        for error in errors:
+            print("functional_error=%s message=%s" % (error.get("kind", "unknown"), error.get("message", "")))
+        raise SystemExit(4)
+    print(
+        "functional_validation=ok framebuffer=%s samples=%s unique_colors=%s luma_range=%s checksum=%s visual_required=%s"
+        % (
+            probe.get("classification", ""),
+            probe.get("sampleCount", ""),
+            probe.get("uniqueColors", ""),
+            probe.get("lumaRange", ""),
+            probe.get("checksum", ""),
+            int(require_visual),
+        )
+    )
+
+
 def cmd_suite_workload_result(args):
     (
         workload,
@@ -224,13 +495,29 @@ def cmd_suite_workload_result(args):
     cpu_regression_pct = float(cpu_regression_pct_s)
 
     result_path = outdir / "browser-result.json"
+    conflict_path = outdir / "terminal-result-conflicts.jsonl"
     active_path = outdir / "active.cpu"
     status = "ok" if rc == 0 and result_path.exists() else f"failed:{rc}"
+    if conflict_path.exists() and conflict_path.stat().st_size > 0:
+        status = "terminal-result-conflict"
     result = {}
     if result_path.exists():
         result = json.loads(result_path.read_text(encoding="utf-8"))
-        if result.get("error"):
+        if result.get("terminalStatus") != "ok" or result.get("error"):
             status = "browser-error"
+
+    visual_required = (outdir / "visual-summary.txt").exists()
+    visual_alerts, visual_mid = assess_visual_primary(outdir, required=visual_required)
+    framebuffer_alerts = []
+    if result and result.get("terminalStatus") == "ok" and not result.get("error"):
+        framebuffer_alerts = assess_framebuffer_probe(result)
+    functional_alerts = framebuffer_alerts + visual_alerts
+    if status == "ok" and functional_alerts:
+        status = "functional-failure"
+
+    visual_mid_class = visual_mid.get("classification")
+    visual_mid_source = visual_mid.get("source")
+    visual_mid_signature = visual_mid.get("signature")
 
     cpu_avg = ""
     if active_path.exists():
@@ -266,41 +553,10 @@ def cmd_suite_workload_result(args):
     mode = str(result.get("config", {}).get("schedulerMode", "-") if result else "-")
     sync_every = str(result.get("config", {}).get("syncEvery", "-") if result else "-")
 
-    row = [
-        workload,
-        status,
-        mode,
-        sync_every,
-        f"{result.get('fpsAvg', 0):.2f}" if result else "-",
-        f"{result.get('frameMsP95', 0):.2f}" if result else "-",
-        value_or_dash(gpu.get("usable")),
-        value_or_dash(gpu.get("msP95"), "%.2f"),
-        value_or_dash(gpu.get("samples")),
-        cpu_avg or "-",
-        canvas_s or "-",
-        value_or_dash(estimated.get("drawCallsPerFrame")),
-        value_or_dash(estimated.get("verticesPerFrame")),
-        value_or_dash(estimated.get("trianglesPerFrame")),
-        value_or_dash(pixels_per_frame),
-        value_or_dash(estimated.get("stencilPixelsPerFrame")),
-        value_or_dash(estimated.get("textureSamplesPerFrame")),
-        value_or_dash(estimated.get("framebufferBindsPerFrame")),
-        value_or_dash(estimated.get("stateChangesPerFrame")),
-        value_or_dash(throughput.get("estimatedMiBPerSecond"), "%.2f"),
-        value_or_dash(throughput.get("colorMiBPerSecond"), "%.2f"),
-        value_or_dash(throughput.get("textureSampleMiBPerSecond"), "%.2f"),
-        value_or_dash(throughput.get("clearMiBPerSecond"), "%.2f"),
-        value_or_dash(throughput.get("renderTargetMiBPerSecond"), "%.2f"),
-        value_or_dash(throughput.get("stencilMiBPerSecond"), "%.2f"),
-        value_or_dash(throughput.get("uploadMiBPerSecond"), "%.2f"),
-        str(outdir),
-    ]
-    with tsv_path.open("a", encoding="utf-8") as fh:
-        fh.write("\t".join(row) + "\n")
-
     alerts = []
     if status != "ok":
         alerts.append({"kind": "status", "message": status})
+    alerts.extend(functional_alerts)
 
     summary_text = ""
     summary_path = outdir / "summary.txt"
@@ -319,39 +575,8 @@ def cmd_suite_workload_result(args):
             "message": "benchmark page did not reach the measured rendering phase",
         })
 
-    visual_primary = load_visual_primary(outdir)
-    visual_mid = visual_primary.get("measure_mid", {})
-    visual_mid_class = visual_mid.get("classification")
-    visual_mid_source = visual_mid.get("source")
-    visual_mid_signature = visual_mid.get("signature")
     visual_mid_hash = None
     visual_hash_duplicate = None
-    if status == "ok" and (outdir / "visual-summary.txt").exists() and not visual_mid_class:
-        alerts.append({
-            "kind": "visual-primary-missing",
-            "metric": "measure-mid",
-            "message": "primary mid-run screenshot was not available",
-        })
-    elif (
-        visual_mid_class
-        and visual_mid_class != "visible-varied"
-        and visual_mid_signature != "present"
-    ):
-        alerts.append({
-            "kind": "visual-primary",
-            "metric": "measure-mid",
-            "actual": visual_mid_class,
-            "source": visual_mid_source,
-            "message": "primary mid-run screenshot did not show varied graphical output or the current workload/run visual signature",
-        })
-    if visual_mid_signature and visual_mid_signature != "present":
-        alerts.append({
-            "kind": "visual-primary-signature",
-            "metric": "measure-mid",
-            "actual": visual_mid_signature,
-            "source": visual_mid_source,
-            "message": "primary mid-run screenshot did not contain the current workload/run visual signature",
-        })
     if visual_mid_source:
         visual_source_path = outdir / visual_mid_source
         if visual_source_path.exists():
@@ -375,7 +600,7 @@ def cmd_suite_workload_result(args):
                 fh.write(f"{workload}\t{visual_mid_source}\t{visual_mid_hash}\n")
 
     baseline = load_baseline(baseline_path_s).get(workload)
-    if baseline:
+    if baseline and status == "ok" and not functional_alerts:
         base_fps = baseline.get("fpsAvg")
         if fps_avg is not None and base_fps and fps_avg < base_fps * (1.0 - fps_regression_pct / 100.0):
             alerts.append({
@@ -404,6 +629,51 @@ def cmd_suite_workload_result(args):
                 "thresholdPct": cpu_regression_pct,
             })
 
+    framebuffer_probe_ok = framebuffer_probe_valid(result.get("framebufferProbe"))
+    baseline_eligible = (
+        status == "ok"
+        and not alerts
+        and framebuffer_probe_ok
+        and visual_mid_class == "visible-varied"
+        and visual_mid_signature == "present"
+    )
+    row = [
+        workload,
+        status,
+        mode,
+        sync_every,
+        f"{result.get('fpsAvg', 0):.2f}" if result else "-",
+        f"{result.get('frameMsP95', 0):.2f}" if result else "-",
+        value_or_dash(gpu.get("usable")),
+        value_or_dash(gpu.get("msP95"), "%.2f"),
+        value_or_dash(gpu.get("samples")),
+        cpu_avg or "-",
+        canvas_s or "-",
+        "1" if framebuffer_probe_ok else "0",
+        visual_mid_class or "-",
+        visual_mid_signature or "-",
+        "1" if baseline_eligible else "0",
+        str(len(alerts)),
+        value_or_dash(estimated.get("drawCallsPerFrame")),
+        value_or_dash(estimated.get("verticesPerFrame")),
+        value_or_dash(estimated.get("trianglesPerFrame")),
+        value_or_dash(pixels_per_frame),
+        value_or_dash(estimated.get("stencilPixelsPerFrame")),
+        value_or_dash(estimated.get("textureSamplesPerFrame")),
+        value_or_dash(estimated.get("framebufferBindsPerFrame")),
+        value_or_dash(estimated.get("stateChangesPerFrame")),
+        value_or_dash(throughput.get("estimatedMiBPerSecond"), "%.2f"),
+        value_or_dash(throughput.get("colorMiBPerSecond"), "%.2f"),
+        value_or_dash(throughput.get("textureSampleMiBPerSecond"), "%.2f"),
+        value_or_dash(throughput.get("clearMiBPerSecond"), "%.2f"),
+        value_or_dash(throughput.get("renderTargetMiBPerSecond"), "%.2f"),
+        value_or_dash(throughput.get("stencilMiBPerSecond"), "%.2f"),
+        value_or_dash(throughput.get("uploadMiBPerSecond"), "%.2f"),
+        str(outdir),
+    ]
+    with tsv_path.open("a", encoding="utf-8") as fh:
+        fh.write("\t".join(row) + "\n")
+
     metrics = {
         "fpsAvg": fps_avg,
         "frameMsP95": frame_ms_p95,
@@ -431,6 +701,7 @@ def cmd_suite_workload_result(args):
         "visualPrimaryMeasureMidSignature": visual_mid_signature,
         "visualPrimaryMeasureMidHash": visual_mid_hash[:16] if visual_mid_hash else None,
         "visualPrimaryDuplicateOf": visual_hash_duplicate,
+        "framebufferProbe": result.get("framebufferProbe") if result else None,
     }
     event = {
         "event": "suite-workload-result",
@@ -485,14 +756,20 @@ def cmd_suite_workload_result(args):
 
 
 def cmd_suite_complete(args):
-    events, latest, status_path, root, results, alerts = args
+    events, latest, status_path, root, results, alerts, total = args
+    complete = int(results) == int(total)
     event_line = emit_event(events, latest, {
-        "event": "suite-complete",
+        "event": "suite-complete" if complete else "suite-incomplete",
         "suiteRoot": root,
         "results": int(results),
         "alerts": int(alerts),
+        "expected": int(total),
     })
-    pathlib.Path(status_path).write_text(f"complete results={results} alerts={alerts} suite_root={root}\n", encoding="utf-8")
+    state = "complete" if complete else "incomplete"
+    pathlib.Path(status_path).write_text(
+        f"{state} results={results} expected={total} alerts={alerts} suite_root={root}\n",
+        encoding="utf-8",
+    )
     return event_line
 
 
@@ -582,17 +859,226 @@ def signature_colors(workload, run):
     return colors
 
 
+def screenshot_to_srgb(img):
+    profile_bytes = img.info.get("icc_profile")
+    if profile_bytes:
+        try:
+            from PIL import ImageCms
+            source_profile = ImageCms.ImageCmsProfile(io.BytesIO(profile_bytes))
+            return ImageCms.profileToProfile(
+                img,
+                source_profile,
+                ImageCms.createProfile("sRGB"),
+                outputMode="RGB",
+            )
+        except Exception:
+            pass
+    return img.convert("RGB")
+
+
+def detect_visual_signature(img, expected_signature, tolerance=32):
+    if not expected_signature:
+        return {"available": False}
+
+    from PIL import Image, ImageChops
+
+    width, height = img.size
+    region_box = (
+        max(0, round(width * 0.50)),
+        max(0, round(height * 0.55)),
+        width,
+        height,
+    )
+    region = img.crop(region_box).convert("RGB")
+    region_width, region_height = region.size
+    scale = min(1.0, 720.0 / max(region_width, region_height, 1))
+    mask_width = max(1, round(region_width * scale))
+    mask_height = max(1, round(region_height * scale))
+    red, green, blue = region.split()
+    channel_luts = {
+        value: [255 if abs(sample - value) <= tolerance else 0 for sample in range(256)]
+        for color in expected_signature
+        for value in color
+    }
+    resampling = Image.Resampling.BOX if hasattr(Image, "Resampling") else Image.BOX
+
+    def components_for(color):
+        masks = [
+            channel.point(channel_luts[value])
+            for channel, value in zip((red, green, blue), color)
+        ]
+        mask = ImageChops.multiply(ImageChops.multiply(masks[0], masks[1]), masks[2])
+        if scale < 1.0:
+            mask = mask.resize((mask_width, mask_height), resampling)
+        mask = mask.point(lambda value: 255 if value >= 160 else 0)
+        pixels = mask.tobytes()
+        visited = bytearray(len(pixels))
+        components = []
+        minimum_side = max(5, round(min(mask_width, mask_height) * 0.012))
+        maximum_side = max(minimum_side, round(min(mask_width, mask_height) * 0.35))
+
+        for start, value in enumerate(pixels):
+            if value == 0 or visited[start]:
+                continue
+            visited[start] = 1
+            stack = [start]
+            area = 0
+            min_x = mask_width
+            min_y = mask_height
+            max_x = 0
+            max_y = 0
+            while stack:
+                index = stack.pop()
+                y, x = divmod(index, mask_width)
+                area += 1
+                min_x = min(min_x, x)
+                min_y = min(min_y, y)
+                max_x = max(max_x, x)
+                max_y = max(max_y, y)
+                if x > 0:
+                    neighbor = index - 1
+                    if pixels[neighbor] and not visited[neighbor]:
+                        visited[neighbor] = 1
+                        stack.append(neighbor)
+                if x + 1 < mask_width:
+                    neighbor = index + 1
+                    if pixels[neighbor] and not visited[neighbor]:
+                        visited[neighbor] = 1
+                        stack.append(neighbor)
+                if y > 0:
+                    neighbor = index - mask_width
+                    if pixels[neighbor] and not visited[neighbor]:
+                        visited[neighbor] = 1
+                        stack.append(neighbor)
+                if y + 1 < mask_height:
+                    neighbor = index + mask_width
+                    if pixels[neighbor] and not visited[neighbor]:
+                        visited[neighbor] = 1
+                        stack.append(neighbor)
+
+            component_width = max_x - min_x + 1
+            component_height = max_y - min_y + 1
+            fill_ratio = area / (component_width * component_height)
+            aspect = component_width / component_height
+            if (
+                component_width < minimum_side
+                or component_height < minimum_side
+                or component_width > maximum_side
+                or component_height > maximum_side
+                or not 0.65 <= aspect <= 1.55
+                or fill_ratio < 0.55
+            ):
+                continue
+            components.append({
+                "area": area,
+                "width": component_width,
+                "height": component_height,
+                "centerX": (min_x + max_x) / 2,
+                "centerY": (min_y + max_y) / 2,
+                "right": max_x,
+                "bottom": max_y,
+                "fillRatio": fill_ratio,
+            })
+
+        components.sort(
+            key=lambda component: component["area"]
+            * (1.0 + component["centerX"] / mask_width + component["centerY"] / mask_height),
+            reverse=True,
+        )
+        # State-churn scenes can contain many large rectangles close to a signature
+        # color. Keep a bounded pool large enough that those tiles cannot crowd the
+        # smaller DOM cells out before the ordered-row geometry check runs.
+        return components[:32]
+
+    candidates = [components_for(color) for color in expected_signature]
+    selected = None
+    selected_score = None
+    if all(candidates):
+        for combination in itertools.product(*candidates):
+            centers_x = [component["centerX"] for component in combination]
+            if centers_x != sorted(centers_x) or len(set(centers_x)) != 4:
+                continue
+            sides = [(component["width"] + component["height"]) / 2 for component in combination]
+            typical_side = sum(sides) / len(sides)
+            if max(sides) / min(sides) > 1.6:
+                continue
+            centers_y = [component["centerY"] for component in combination]
+            if max(centers_y) - min(centers_y) > typical_side * 0.35:
+                continue
+            gaps = [centers_x[i + 1] - centers_x[i] for i in range(3)]
+            if min(gaps) < typical_side * 0.90 or max(gaps) > typical_side * 1.80:
+                continue
+            if max(gaps) / min(gaps) > 1.25:
+                continue
+            # A fullscreen VM can letterbox a fixed 4K guest inside a larger host
+            # display. Keep the row in the bottom-right half, but allow the host-side
+            # margin to be substantially wider than a signature cell.
+            if mask_width - combination[-1]["right"] > typical_side * 20.0:
+                continue
+            if mask_height - max(component["bottom"] for component in combination) > typical_side * 14.0:
+                continue
+            score = sum(component["area"] for component in combination)
+            if selected_score is None or score > selected_score:
+                selected = combination
+                selected_score = score
+
+    counts = [0, 0, 0, 0]
+    geometry = None
+    if selected:
+        counts = [round(component["area"] / (scale * scale)) for component in selected]
+        geometry = [{
+            "centerX": round(region_box[0] + component["centerX"] / scale, 1),
+            "centerY": round(region_box[1] + component["centerY"] / scale, 1),
+            "width": round(component["width"] / scale, 1),
+            "height": round(component["height"] / scale, 1),
+        } for component in selected]
+    return {
+        "available": True,
+        "present": selected is not None,
+        "hits": 4 if selected else 0,
+        "total": 4,
+        "counts": counts,
+        "source": "bottom-right-geometry",
+        "expected": [list(color) for color in expected_signature],
+        "tolerance": tolerance,
+        "candidateColors": sum(1 for items in candidates if items),
+        "geometry": geometry,
+    }
+
+
+def detect_visual_signature_variants(variants, expected_signature):
+    results = []
+    for representation, image in variants:
+        result = detect_visual_signature(image, expected_signature)
+        result["representation"] = representation
+        results.append(result)
+    if not results:
+        return {"available": False}
+    return max(
+        results,
+        key=lambda result: (
+            1 if result.get("present") else 0,
+            result.get("candidateColors", 0),
+            sum(result.get("counts", [])),
+        ),
+    )
+
+
 def luma(rgb):
     return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
 
 
-def classify(mean_luma, std_luma, white_ratio, black_ratio, gray_ratio):
+def classify(mean_luma, std_luma, white_ratio, black_ratio, gray_ratio, chromatic_ratio):
     if white_ratio >= 0.90:
         return "blank-white"
     if black_ratio >= 0.90 and std_luma < 8:
         return "blank-black"
     if gray_ratio >= 0.90 and std_luma < 14:
         return "blank-gray"
+    if chromatic_ratio < 0.001:
+        return "achromatic-varied"
+    if chromatic_ratio >= 0.01 and std_luma >= 6:
+        return "visible-varied"
     if white_ratio >= 0.72:
         return "mostly-white"
     if black_ratio >= 0.72:
@@ -616,6 +1102,14 @@ def classify(mean_luma, std_luma, white_ratio, black_ratio, gray_ratio):
             return "low-contrast-white"
         return "low-contrast-gray"
     return "visible-varied"
+
+
+def content_region_box(width, height):
+    left = min(width - 1, max(0, round(width * 0.35)))
+    top = min(height - 1, max(0, round(height * 0.52)))
+    right = max(left + 1, min(width, round(width * 0.95)))
+    bottom = max(top + 1, min(height, round(height * 0.80)))
+    return left, top, right, bottom
 
 
 def cmd_analyze_visuals(args):
@@ -655,12 +1149,13 @@ def cmd_analyze_visuals(args):
         sample.thumbnail((256, 256))
         colors = sample.getcolors(maxcolors=65536)
         unique_sampled = None if colors is None else len(colors)
-        sample_pixels = sample.get_flattened_data() if hasattr(sample, "get_flattened_data") else sample.getdata()
+        sample_pixels = list(sample.get_flattened_data() if hasattr(sample, "get_flattened_data") else sample.getdata())
         sample_lumas = [luma(pixel) for pixel in sample_pixels]
         sample_count = max(len(sample_lumas), 1)
         white_ratio = sum(1 for value in sample_lumas if value >= 245) / sample_count
         black_ratio = sum(1 for value in sample_lumas if value <= 12) / sample_count
         gray_ratio = sum(1 for value in sample_lumas if 170 <= value <= 235) / sample_count
+        chromatic_ratio = sum(1 for r, g, b in sample_pixels if max(r, g, b) - min(r, g, b) >= 12) / sample_count
         return {
             "mean_rgb": [round(v, 2) for v in mean_rgb],
             "stddev_rgb": [round(v, 2) for v in std_rgb],
@@ -669,63 +1164,13 @@ def cmd_analyze_visuals(args):
             "white_ratio": round(white_ratio, 4),
             "black_ratio": round(black_ratio, 4),
             "gray_ratio": round(gray_ratio, 4),
+            "chromatic_ratio": round(chromatic_ratio, 4),
             "unique_colors_sampled": unique_sampled,
-            "classification": classify(mean_luma, std_luma, white_ratio, black_ratio, gray_ratio),
+            "classification": classify(mean_luma, std_luma, white_ratio, black_ratio, gray_ratio, chromatic_ratio),
         }
 
     def content_region(img):
-        w, h = img.size
-        if w >= 1000 and h >= 700:
-            left = min(max(700, w // 3), max(w - 1, 0))
-            top = min(max(380, h // 3), max(h - 1, 0))
-            right = max(left + 1, w - max(40, w // 32))
-            bottom = max(top + 1, h - max(320, h // 4))
-            return img.crop((left, top, right, bottom))
-        return img.crop((w // 4, h // 4, max(w // 4 + 1, 3 * w // 4), max(h // 4 + 1, 3 * h // 4)))
-
-    def signature_for(img):
-        if not expected_signature:
-            return {"available": False}
-
-        def count_in(sample_img):
-            sample = sample_img.copy()
-            sample.thumbnail((1280, 1280))
-            counts = [0 for _ in expected_signature]
-            max_distance_sq = 72 * 72
-            pixels = sample.get_flattened_data() if hasattr(sample, "get_flattened_data") else sample.getdata()
-            for r, g, b in pixels:
-                for i, (er, eg, eb) in enumerate(expected_signature):
-                    if (r - er) * (r - er) + (g - eg) * (g - eg) + (b - eb) * (b - eb) <= max_distance_sq:
-                        counts[i] += 1
-            return counts
-
-        w, h = img.size
-        region = img.crop((
-            max(0, w - max(520, w // 3)),
-            max(0, h - max(360, h // 3)),
-            w,
-            h,
-        ))
-        counts = count_in(region)
-        min_count = 180
-        hits = sum(1 for count in counts if count >= min_count)
-        source = "bottom-right"
-        if hits < 3:
-            full_counts = count_in(img)
-            full_hits = sum(1 for count in full_counts if count >= min_count)
-            if full_hits > hits:
-                counts = full_counts
-                hits = full_hits
-                source = "full"
-        return {
-            "available": True,
-            "present": hits >= 3,
-            "hits": hits,
-            "total": len(expected_signature),
-            "counts": counts,
-            "source": source,
-            "expected": [list(color) for color in expected_signature],
-        }
+        return img.crop(content_region_box(*img.size))
 
     entries = []
     for name in (
@@ -742,7 +1187,9 @@ def cmd_analyze_visuals(args):
         if not path.exists():
             continue
         try:
-            img = Image.open(path).convert("RGB")
+            with Image.open(path) as source:
+                encoded_img = source.convert("RGB")
+                img = screenshot_to_srgb(source)
         except Exception as exc:
             entries.append({"file": name, "error": str(exc)})
             continue
@@ -753,7 +1200,10 @@ def cmd_analyze_visuals(args):
             "height": img.height,
             "full": stats_for(img),
             "content": stats_for(region),
-            "signature": signature_for(img),
+            "signature": detect_visual_signature_variants(
+                (("encoded-rgb", encoded_img), ("srgb", img)),
+                expected_signature,
+            ),
         })
 
     if not entries:
@@ -782,6 +1232,8 @@ def cmd_analyze_visuals(args):
                 signature.get("total", 0),
                 counts,
             )
+            if signature.get("representation"):
+                signature_text += " signature_space=%s" % signature["representation"]
         lines.append(
             "visual_%s=%s %sx%s content_luma=%.2f content_std=%.2f full=%s%s" % (
                 key,
@@ -842,6 +1294,20 @@ def cmd_analyze_visuals(args):
 
 def cmd_browser_summary(args):
     data = json.load(open(args[0], encoding="utf-8"))
+    probe = data.get("framebufferProbe", {})
+    if probe:
+        print(
+            "browser_framebuffer_probe=ok:%s class:%s samples:%s bins:%s chromatic:%s luma_range:%s checksum:%s"
+            % (
+                probe.get("ok", False),
+                probe.get("classification", ""),
+                probe.get("sampleCount", 0),
+                probe.get("uniqueColorBins", probe.get("uniqueColors", 0)),
+                probe.get("chromaticSamples", 0),
+                probe.get("lumaRange", ""),
+                probe.get("checksum", ""),
+            )
+        )
     if "error" in data:
         print("browser_error=%s" % data["error"])
         return
@@ -949,12 +1415,14 @@ COMMANDS = {
     "find-port": cmd_find_port,
     "reset-vm": cmd_reset_vm,
     "suite-start": cmd_suite_start,
+    "suite-header": cmd_suite_header,
     "suite-workload-start": cmd_suite_workload_start,
     "suite-workload-result": cmd_suite_workload_result,
     "suite-complete": cmd_suite_complete,
     "write-config": cmd_write_config,
     "crash-diagnostics": cmd_crash_diagnostics,
     "analyze-visuals": cmd_analyze_visuals,
+    "validate-run": cmd_validate_run,
     "browser-summary": cmd_browser_summary,
 }
 

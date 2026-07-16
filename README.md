@@ -129,10 +129,13 @@ With `TARGET=vm`, the runner uses `VBoxManage` to open the URL in the guest, cap
 VM screenshots, gather selected VM state, collect VMSVGA statistics, and scan the VM
 log for known graphics-alert patterns.
 
-VM browser navigation defaults to opening the URL through the Windows Run dialog.
-That avoids depending on a focused Edge tab and proved more reliable for repeated
-automated suite runs. The older address-bar reuse path is still available with
-`LAUNCH_METHOD=browser` for manual debugging.
+VM browser navigation defaults to launching the configured browser explicitly through
+the Windows Run dialog, with a disposable profile and the recorded guest browser
+flags. The runner first opens a blank isolated window, waits for Edge to own keyboard
+focus, and then types the exact run URL into its address bar. That avoids Windows Run
+parsing URL query separators and avoids depending on an older focused Edge tab. The
+older address-bar reuse path is still available with `LAUNCH_METHOD=browser` for
+manual debugging.
 
 With `TARGET=local`, the runner opens the URL in local Chrome and skips the VM-only
 probes. By default it launches Chrome with a disposable `--user-data-dir` inside the
@@ -147,11 +150,13 @@ For suites, the runner executes several workloads and writes aggregate TSV/JSONL
 so we can compare patched and baseline builds with minimal manual work.
 
 VM suites default to one persistent host HTTP server and one stable port for the whole
-suite. Each workload still gets its own output directory; the server routes
-`/event` and `/result` posts by `runId`. This avoids interpreting a guest networking
-or repeated-navigation failure as a rendering result. It also keeps the completed
-browser window visible between runs by default, so the user can see the last rendered
-scene instead of a hidden tab, a desktop transition, or a forcibly closed browser.
+suite. Each workload still gets its own output directory; the server routes `/event`
+and `/result` posts by `runId` and rejects stale page requests whose run id no longer
+matches the current workload configuration. This avoids interpreting a guest
+networking or repeated-navigation failure as a rendering result. Explicit-profile VM
+runs terminate and remove the isolated browser after screenshots are captured, so
+later workloads do not inherit its processes or memory; the captured mid-run image
+remains the durable visual evidence.
 
 ## Workload Families
 
@@ -244,24 +249,39 @@ Common controls:
 - `SUITE`: workload suite name, such as `smoke`, `default`, `heavy`, or `all`.
 - `DURATION`: measured runtime in seconds.
 - `WARMUP`: warmup time before measurement.
-- `START_DELAY_MS`: optional browser-side delay before WebGL setup starts. This is
-  useful for VM automation where the runner opens the URL first and then maximizes the
-  normal browser window before measurement.
+- `START_DELAY_MS`: browser-side delay before WebGL setup starts. It defaults to three
+  seconds for VM automation so the runner can launch and resize/fullscreen the guest
+  browser before warmup, and to zero for local runs.
 - `DPR`: device pixel ratio override, or `auto`.
 - `MAX_CANVAS_PIXELS`: canvas pixel cap. This defaults to a safer capped value.
   Raise it for explicit 4K or Retina throughput runs; for example,
   `MAX_CANVAS_PIXELS=12000000` allows a 3840x2160-class render target.
+- `EXPECTED_CANVAS_WIDTH` and `EXPECTED_CANVAS_HEIGHT`: optional minimum backing-store
+  dimensions. Use these for resolution/fullscreen matrices; a result below either
+  requested dimension is a functional failure rather than comparable performance data.
+  VM runs with `BROWSER_FULLSCREEN=1` require both values to be positive so an
+  accidentally small or resized guest cannot be accepted as fullscreen evidence.
 - `OUTROOT`: parent directory for benchmark artifacts.
 - `BASELINE`: previous `suite-results.jsonl` used for comparisons.
 - `VIRTUALBOX_SRC`: optional VirtualBox source checkout used only to record the tested
   source commit in `host-info.txt`.
 - `MIDRUN_SCREENSHOT`: defaults to `1`; captures a screenshot during the measurement
-  window as `measure-mid.png`.
+  phase as `measure-mid.png`.
 - `MIDRUN_SCREENSHOT_DELAY`: optional delay in seconds before `measure-mid.png`. The
-  default is one second after the browser posts `measure-start`, which avoids mistaking
-  post-run WebGL context release for a rendering failure.
+  default is zero: capture starts as soon as the browser posts `measure-start`. On
+  macOS, the window lookup helper is compiled before browser launch so helper startup
+  time cannot push short-run screenshots past context release. For VM runs the
+  user-visible host window is captured synchronously before requesting the guest PNG;
+  this prevents `VBoxManage screenshotpng` from holding the display path until after
+  the browser has released its final frame.
+- `RELEASE_CONTEXT`: controls whether the page releases WebGL resources after it posts
+  its result. When mid-run capture is enabled, the default is `0`: the measured final
+  scene remains visible until the runner finishes host and guest captures and closes
+  its isolated browser. This makes short Retina runs reliable even when PNG capture
+  completes after the timed measurement. With `MIDRUN_SCREENSHOT=0`, the default is
+  `1`; either default can be overridden explicitly.
 - `VISUAL_ANALYSIS`: defaults to `1`; classifies screenshots as blank black, blank
-  white, blank gray, low contrast, or varied output.
+  white, blank gray, achromatic, low contrast, or varied output.
 - `HOST_WINDOW_SCREENSHOT`: defaults to `1` for VM runs; captures the actual macOS
   VirtualBoxVM window in addition to the guest framebuffer. This catches host
   presentation failures that `VBoxManage screenshotpng` cannot see. The current
@@ -270,17 +290,31 @@ Common controls:
 - `FOCUS_SCREENSHOT_WINDOW`: defaults to `1` for VM host-window screenshots. The
   runner brings the VirtualBox window forward before capturing it so `screencapture`
   does not read a stale background-window backing store.
-- `LAUNCH_METHOD`: defaults to `keyboard` for VM runs. This opens the benchmark URL
-  through the Windows Run dialog and avoids relying on a focused browser address bar.
+- `LAUNCH_METHOD`: defaults to `run` for VM runs. This launches `GUEST_BROWSER_EXE`
+  with its disposable profile and flags through the Windows Run dialog, waits for the
+  new window, then navigates through its address bar. This avoids both unknown
+  default-browser state and Windows Run truncation of query-bearing URLs.
   Set `LAUNCH_METHOD=browser` to reuse the active browser tab during manual debugging.
+- `GUEST_BROWSER_STARTUP_SECONDS`: seconds to wait for the new isolated guest browser
+  window before focusing its address bar; defaults to `5`.
+- `GUEST_BROWSER_PROFILE`: optional guest profile path. When omitted, the runner owns
+  a run-specific `%TEMP%\\dxmtbench-*` profile and removes it during cleanup. A
+  caller-supplied profile is never removed by the runner.
 - `GUEST_BROWSER_MAXIMIZE`: defaults to `1` for VM runs. After opening the benchmark
   URL, the runner sends a normal Windows maximize gesture to the active browser window
   so high-resolution guest modes actually enlarge the WebGL render target. This is
   separate from browser fullscreen.
 - `BROWSER_FULLSCREEN`: defaults to `0`. Fullscreen toggling is opt-in because it can
-  make repeated automated suite runs harder to correlate with the visible tab.
-- `CLEANUP_BROWSER`: defaults to `0` for VM runs and normal local Chrome sessions;
-  defaults to `1` only for isolated local Chrome runs.
+  make repeated automated suite runs harder to correlate with the visible tab. When
+  enabled for a VM run, positive `EXPECTED_CANVAS_WIDTH` and
+  `EXPECTED_CANVAS_HEIGHT` values are mandatory.
+- `CLEANUP_BROWSER`: defaults to `1` for explicit-profile VM launches and isolated
+  local Chrome runs, and to `0` for address-bar reuse or a normal local Chrome session.
+  VM cleanup terminates `GUEST_BROWSER_PROCESS` and removes the disposable profile.
+- `GUEST_KILL_BROWSER_BEFORE_RUN`: defaults to `1` for explicit-profile VM launches,
+  preventing an older Edge tree from contaminating the first or next measurement.
+- `GUEST_BROWSER_PROCESS`: process image terminated by isolated VM cleanup; defaults
+  to `msedge.exe`.
 - `SUITE_PERSISTENT_SERVER`: defaults to `1` for VM suites; one host server and one
   port are reused for all workloads while per-run events are still routed into the
   correct workload directory.
@@ -312,6 +346,9 @@ Safety controls:
   burst mode, explicit finish loops, or very large stress settings.
 - `FAIL_ON_GRAPHICS_ALERT=1`: makes the runner fail if known graphics-alert patterns
   appear in collected logs.
+- `FAIL_ON_ALERT`: defaults to `1`, so a suite exits nonzero when any workload has a
+  functional, transport, graphics, or configured baseline-regression alert. Set it to
+  `0` only when intentionally collecting a failing diagnostic matrix.
 
 Local browser controls:
 
@@ -359,6 +396,8 @@ Important files:
 - `host-info.txt`: host and VirtualBox version context.
 - `browser-events.jsonl`: progress, warnings, and lifecycle events posted by the page.
 - `browser-result.json`: final browser-side benchmark result.
+- `functional-validation.txt`: the final functional gate decision and reason codes.
+  A run exits nonzero if this file reports `failed`.
 - `summary.txt`: compact human-readable run summary.
 - `active.cpu`: sampled active CPU for the host `VirtualBoxVM` process.
 - `VirtualBoxVM.sample.txt`: macOS process sample when available.
@@ -377,6 +416,9 @@ Important files:
   identify the screenshot that should be used for pass/fail checks. For VM runs this
   prefers the host VirtualBox window capture, because accelerated output may not be
   represented in `VBoxManage screenshotpng`.
+- `framebufferProbe` inside `browser-result.json`: a post-measurement WebGL readback
+  sampled across the default framebuffer. It records color-bin variation, chromatic
+  samples, checksum, context state, and GL errors without adding probe time to FPS.
 - `vminfo-before.txt` and `vminfo-after.txt`: selected VM state snapshots.
 - `vmsvga-stats.xml`: VMSVGA statistics when available.
 - `graphics-alerts.log`: matched graphics-alert lines from logs.
@@ -400,6 +442,11 @@ These files are designed so an agent or script can consume only the small JSONL/
 summaries during development, while detailed logs and screenshots remain available
 when a run regresses.
 
+The TSV row is written only after functional and graphics-alert validation completes.
+Its `baseline_eligible` field is true only for an alert-free `ok` result with a valid
+browser framebuffer proof and the current run's varied visual signature. Baseline
+loading rejects older rows that do not carry this functional evidence.
+
 ## Visual Correctness Gate
 
 Every workload is expected to show graphical output while it is running. A completed
@@ -412,12 +459,30 @@ Before blaming a VirtualBox branch, run the same workload locally in Chrome:
 TARGET=local ALLOW_HEAVY=1 SUITE=all ./dxmtbench.sh
 ```
 
-For a healthy benchmark, each workload should produce `browser-result.json` and a
-`visual_primary_measure_mid=visible-varied` line in `visual-summary.txt`. If a
-workload fails that local Chrome check, fix the benchmark first. If it passes locally
-but the VM run is black, white, gray, stale, or missing the expected scene in the
-primary VM screenshot, investigate the VirtualBox guest, device, DXMT, or host
-presentation path for that branch.
+For a healthy benchmark, each workload must satisfy both independent gates:
+
+1. `browser-result.json` contains `framebufferProbe.ok=true`, proving that the WebGL
+   default framebuffer was nonuniform, chromatic, context-intact, and free of GL
+   errors at the end of measurement.
+2. `visual-summary.txt` contains
+   `visual_primary_measure_mid=visible-varied ... signature=present`, proving that the
+   current scene reached the actual browser/VirtualBox presentation path during the
+   measurement window.
+
+The DOM signature proves screenshot freshness only; it never excuses blank,
+achromatic, or otherwise invalid scene pixels. An unexpected WebGL context loss is a
+terminal functional failure. If a workload fails the local Chrome gates, fix the
+benchmark first. If it passes locally but the VM run is black, white, gray, stale, or
+missing the expected scene in the primary VM screenshot, investigate the VirtualBox
+guest, device, DXMT, or host presentation path for that branch.
+
+Visual classification normalizes embedded screenshot color profiles to sRGB. The
+freshness signature is checked in both that normalized image and the PNG's encoded RGB
+values, because macOS display-profile conversion can clip saturated CSS colors even
+though the captured pixels preserve them exactly. Either representation must still
+contain all four run-specific cells as similarly sized, ordered rectangles in the
+expected bottom-right geometry. Merely finding similar colors elsewhere in a stale
+scene does not satisfy freshness.
 
 VM runs can also fail before the benchmark page starts. Those are not graphics
 throughput results. The suite reports these separately as transport/page-load alerts,
@@ -435,6 +500,8 @@ measured interval.
 The visual classifier crops away the HUD and surrounding browser/window chrome before
 classifying the screenshot. This is intentionally strict: a readable HUD, address bar,
 Windows taskbar, or stale browser tab is not enough to pass the visual gate.
+`VISUAL_ANALYSIS=0` skips only this presentation screenshot gate; the browser-side
+framebuffer probe, browser result, and positive-frame validation remain mandatory.
 
 ## Measurement Model
 
