@@ -98,11 +98,14 @@ const serverConfigKeys = Object.keys(serverConfig).sort();
 const configSource = serverConfigKeys.length ? "server" : "query";
 
 function readParam(name, fallback) {
+    if (serverConfigKeys.length) {
+        if (Object.prototype.hasOwnProperty.call(serverConfig, name))
+            return String(serverConfig[name]);
+        return fallback;
+    }
     const queryValue = params.get(name);
     if (queryValue !== null)
         return queryValue;
-    if (Object.prototype.hasOwnProperty.call(serverConfig, name))
-        return String(serverConfig[name]);
     return fallback;
 }
 
@@ -114,7 +117,7 @@ const requestedDpr = readParam("dpr", "auto");
 const workloadName = readParam("workload", "cubes-fill");
 const workloadNeedsStencil = workloadName.includes("stencil");
 const runId = readParam("run", new Date().toISOString());
-document.title = `DXMTBench ${workloadName} ${runId}`;
+document.title = `DXMTBench ${runId} ${workloadName}`;
 const shaderIters = Math.max(1, Number(readParam("shaderIters", "64")));
 const textureSize = Math.max(16, Number(readParam("textureSize", "1024")));
 const vertexCount = Math.max(256, Number(readParam("vertices", String(Math.max(65536, instances * 128)))));
@@ -127,6 +130,8 @@ const burstChunkMs = Math.min(250, Math.max(1, Number(readParam("chunkMs", "25")
 const finishEachFrame = readParam("finish", "0") === "1";
 const syncEvery = Math.max(0, Math.floor(Number(readParam("syncEvery", "0"))));
 const maxCanvasPixels = Math.max(0, Math.floor(Number(readParam("maxCanvasPixels", "0"))));
+const expectedCanvasWidth = Math.max(0, Math.floor(Number(readParam("expectedCanvasWidth", "0"))));
+const expectedCanvasHeight = Math.max(0, Math.floor(Number(readParam("expectedCanvasHeight", "0"))));
 const releaseContextAfterRun = readParam("releaseContext", "1") !== "0";
 const runTarget = readParam("target", "vm");
 const hostInfo = {
@@ -174,6 +179,8 @@ const config = {
     finishEachFrame,
     syncEvery,
     maxCanvasPixels,
+    expectedCanvasWidth,
+    expectedCanvasHeight,
     releaseContextAfterRun,
     runTarget,
     configSource,
@@ -200,7 +207,8 @@ const state = {
     gpuTimer: null,
     workload: null,
     lastSize: null,
-    contextReleased: false
+    contextReleased: false,
+    terminalResultPosted: false
 };
 
 function fnv1a32(text) {
@@ -269,6 +277,14 @@ function postResult(result) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(result)
     }).catch(() => {});
+}
+
+function postTerminalResult(result) {
+    if (state.terminalResultPosted)
+        return false;
+    postResult(result);
+    state.terminalResultPosted = true;
+    return true;
 }
 
 function setMetric(name, value, className = "") {
@@ -916,9 +932,10 @@ void main() {
         name: withFill ? "cubes-fill" : "cubes-instanced",
         description: withFill ? "full-screen pass plus instanced depth-tested cubes" : "instanced depth-tested cubes",
         frame(t, size) {
-            if (fill)
+            if (fill) {
                 fill.frame(t, size);
-            else {
+                gl.clear(gl.DEPTH_BUFFER_BIT);
+            } else {
                 gl.viewport(0, 0, size.width, size.height);
                 gl.clearColor(0.035, 0.045, 0.065, 1.0);
                 gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
@@ -1675,26 +1692,192 @@ function releaseWebGlContext(reason) {
 }
 
 function failBenchmark(err, where) {
-    if (state.phase === "complete" || state.phase === "error")
+    if (state.terminalResultPosted)
         return;
     state.phase = "error";
     state.error = String(err && (err.stack || err.message) || err);
-    setMetric("phase", "error", "warn");
-    setMetric("error", state.error, "warn");
-    emitEvent("error", { error: state.error, where, workload: workloadName });
-    postResult({
+    const result = {
         runId,
         workload: workloadName,
         config,
         error: state.error,
         where,
+        terminalStatus: "error",
         timestamp: new Date().toISOString(),
         userAgent: navigator.userAgent
-    });
+    };
+    if (!postTerminalResult(result))
+        return;
+    setMetric("phase", "error", "warn");
+    setMetric("error", state.error, "warn");
+    emitEvent("error", { error: state.error, where, workload: workloadName });
+}
+
+function glErrorName(code) {
+    const names = new Map([
+        [gl.INVALID_ENUM, "INVALID_ENUM"],
+        [gl.INVALID_VALUE, "INVALID_VALUE"],
+        [gl.INVALID_OPERATION, "INVALID_OPERATION"],
+        [gl.INVALID_FRAMEBUFFER_OPERATION, "INVALID_FRAMEBUFFER_OPERATION"],
+        [gl.OUT_OF_MEMORY, "OUT_OF_MEMORY"],
+        [gl.CONTEXT_LOST_WEBGL, "CONTEXT_LOST_WEBGL"]
+    ]);
+    return names.get(code) || `0x${code.toString(16)}`;
+}
+
+function drainGlErrors(limit = 32) {
+    const errors = [];
+    for (let i = 0; i < limit; ++i) {
+        const code = gl.getError();
+        if (code === gl.NO_ERROR)
+            break;
+        errors.push(glErrorName(code));
+    }
+    return errors;
+}
+
+function probeDefaultFramebuffer() {
+    const width = canvas.width;
+    const height = canvas.height;
+    const errorsBefore = drainGlErrors();
+    const probe = {
+        ok: false,
+        nonUniform: false,
+        classification: "unavailable",
+        width,
+        height,
+        sampleCount: 0,
+        uniqueColors: 0,
+        lumaMin: null,
+        lumaMax: null,
+        lumaRange: null,
+        channelRange: null,
+        chromaticSamples: 0,
+        chromaticRatio: 0,
+        uniqueColorBins: 0,
+        dominantColorBinSamples: 0,
+        nonDominantSamples: 0,
+        nonDominantRatio: 0,
+        minimumCoverageRatio: 0.005,
+        checksum: null,
+        errorsBefore,
+        errorsAfter: [],
+        contextLostBefore: gl.isContextLost(),
+        contextLostAfter: false
+    };
+    if (probe.contextLostBefore) {
+        probe.reason = "context-lost";
+        return probe;
+    }
+    if (width <= 0 || height <= 0) {
+        probe.reason = "empty-framebuffer";
+        return probe;
+    }
+
+    try {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        gl.finish();
+        const pixels = new Uint8Array(width * height * 4);
+        gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+        probe.errorsAfter = drainGlErrors();
+        probe.contextLostAfter = gl.isContextLost();
+
+        const maxSamples = 262144;
+        const aspect = width / height;
+        const gridWidth = Math.min(width, Math.max(1, Math.ceil(Math.sqrt(maxSamples * aspect))));
+        const gridHeight = Math.min(height, Math.max(1, Math.floor(maxSamples / gridWidth)));
+        const colorBins = new Map();
+        const mins = [255, 255, 255];
+        const maxs = [0, 0, 0];
+        let lumaMin = 255;
+        let lumaMax = 0;
+        let chromaticSamples = 0;
+        let dominantColorBinSamples = 0;
+        let checksum = 0x811c9dc5;
+        let randomState = fnv1a32(`${visualSignature.seed}|framebuffer-probe`);
+        const nextRandom = () => {
+            randomState ^= randomState << 13; randomState >>>= 0;
+            randomState ^= randomState >>> 17; randomState >>>= 0;
+            randomState ^= randomState << 5; randomState >>>= 0;
+            return randomState;
+        };
+        for (let gy = 0; gy < gridHeight; ++gy) {
+            const yStart = Math.floor(gy * height / gridHeight);
+            const yEnd = Math.max(yStart + 1, Math.floor((gy + 1) * height / gridHeight));
+            const y = yStart + nextRandom() % (yEnd - yStart);
+            for (let gx = 0; gx < gridWidth; ++gx) {
+                const xStart = Math.floor(gx * width / gridWidth);
+                const xEnd = Math.max(xStart + 1, Math.floor((gx + 1) * width / gridWidth));
+                const x = xStart + nextRandom() % (xEnd - xStart);
+                const offset = (y * width + x) * 4;
+                const r = pixels[offset];
+                const g = pixels[offset + 1];
+                const b = pixels[offset + 2];
+                const colorBin = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+                const colorBinSamples = (colorBins.get(colorBin) || 0) + 1;
+                colorBins.set(colorBin, colorBinSamples);
+                dominantColorBinSamples = Math.max(dominantColorBinSamples, colorBinSamples);
+                mins[0] = Math.min(mins[0], r);
+                mins[1] = Math.min(mins[1], g);
+                mins[2] = Math.min(mins[2], b);
+                maxs[0] = Math.max(maxs[0], r);
+                maxs[1] = Math.max(maxs[1], g);
+                maxs[2] = Math.max(maxs[2], b);
+                const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                lumaMin = Math.min(lumaMin, luma);
+                lumaMax = Math.max(lumaMax, luma);
+                if (Math.max(r, g, b) - Math.min(r, g, b) >= 12)
+                    chromaticSamples++;
+                checksum = Math.imul(checksum ^ r, 0x01000193) >>> 0;
+                checksum = Math.imul(checksum ^ g, 0x01000193) >>> 0;
+                checksum = Math.imul(checksum ^ b, 0x01000193) >>> 0;
+            }
+        }
+
+        probe.sampleCount = gridWidth * gridHeight;
+        probe.uniqueColors = colorBins.size;
+        probe.uniqueColorBins = colorBins.size;
+        probe.dominantColorBinSamples = dominantColorBinSamples;
+        probe.nonDominantSamples = probe.sampleCount - dominantColorBinSamples;
+        probe.nonDominantRatio = Number((probe.nonDominantSamples / probe.sampleCount).toFixed(6));
+        probe.chromaticSamples = chromaticSamples;
+        probe.chromaticRatio = Number((chromaticSamples / probe.sampleCount).toFixed(6));
+        probe.lumaMin = Number(lumaMin.toFixed(2));
+        probe.lumaMax = Number(lumaMax.toFixed(2));
+        probe.lumaRange = Number((lumaMax - lumaMin).toFixed(2));
+        probe.channelRange = Math.max(
+            maxs[0] - mins[0],
+            maxs[1] - mins[1],
+            maxs[2] - mins[2]
+        );
+        probe.checksum = checksum.toString(16).padStart(8, "0");
+        const minimumCoverageSamples = Math.max(4, Math.ceil(probe.sampleCount * probe.minimumCoverageRatio));
+        probe.minimumCoverageSamples = minimumCoverageSamples;
+        probe.nonUniform = colorBins.size >= 4
+            && probe.nonDominantSamples >= minimumCoverageSamples
+            && probe.channelRange >= 8;
+        const chromatic = chromaticSamples >= minimumCoverageSamples;
+        probe.ok = probe.nonUniform && chromatic && !probe.contextLostAfter
+            && errorsBefore.length === 0 && probe.errorsAfter.length === 0;
+        probe.classification = !probe.nonUniform ? "uniform" : (chromatic ? "visible-varied" : "achromatic");
+        if (probe.contextLostAfter)
+            probe.reason = "context-lost";
+        else if (errorsBefore.length || probe.errorsAfter.length)
+            probe.reason = "webgl-error";
+        else if (!probe.nonUniform)
+            probe.reason = "uniform-framebuffer";
+        else if (!chromatic)
+            probe.reason = "achromatic-framebuffer";
+    } catch (err) {
+        probe.reason = "readpixels-error";
+        probe.error = String(err && (err.stack || err.message) || err);
+        probe.errorsAfter = drainGlErrors();
+    }
+    return probe;
 }
 
 function finish() {
-    state.phase = "complete";
     const frameTimes = state.frameTimes;
     const elapsedMs = Math.max(1, state.measureEnd - state.measureStart);
     const fpsAvg = state.measureFrames * 1000 / elapsedMs;
@@ -1702,6 +1885,9 @@ function finish() {
     const estimated = scaleEstimate(state.workload.estimate(finalSize), passesPerFrame);
     const throughput = deriveThroughput(estimated, fpsAvg);
     const gpuTimer = state.gpuTimer ? state.gpuTimer.summary() : { available: false };
+    const framebufferProbe = probeDefaultFramebuffer();
+    emitEvent("framebuffer-probe", { framebufferProbe });
+    state.phase = framebufferProbe.ok ? "complete" : "error";
     const result = {
         runId,
         workload: workloadName,
@@ -1721,6 +1907,7 @@ function finish() {
         gpuTimer,
         estimated,
         throughput,
+        framebufferProbe,
         visualSignature,
         canvas: {
             width: canvas.width,
@@ -1736,17 +1923,38 @@ function finish() {
         userAgent: navigator.userAgent,
         timestamp: new Date().toISOString()
     };
-    setMetric("phase", "complete");
+    if (!framebufferProbe.ok) {
+        result.error = `functional framebuffer validation failed: ${framebufferProbe.reason || "unknown"}`;
+        result.where = "framebufferProbe";
+        result.terminalStatus = "error";
+        result.functionalFailure = {
+            kind: "framebuffer-probe",
+            reason: framebufferProbe.reason || "unknown"
+        };
+        state.error = result.error;
+        if (!postTerminalResult(result))
+            return;
+        setMetric("error", state.error, "warn");
+        emitEvent("error", { error: state.error, where: result.where, workload: workloadName });
+    } else {
+        result.terminalStatus = "ok";
+    }
+    setMetric("phase", state.phase, framebufferProbe.ok ? "" : "warn");
     updateStatsHud(result.fpsAvg, result.canvas, estimated, throughput);
     setMetric("p95 frame", result.frameMsP95.toFixed(2) + " ms");
     if (gpuTimer.available)
         setMetric("gpu p95", gpuTimer.samples ? gpuTimer.msP95.toFixed(2) + " ms" : "pending");
     emitEvent("measure-end", result);
-    requestAnimationFrame(() => setTimeout(() => {
-        postResult(result);
+    if (!framebufferProbe.ok)
+        return;
+    setTimeout(() => {
+        if (state.phase !== "complete" || state.terminalResultPosted)
+            return;
+        if (!postTerminalResult(result))
+            return;
         if (releaseContextAfterRun)
-            setTimeout(() => releaseWebGlContext("complete"), 1500);
-    }, 50));
+            releaseWebGlContext("complete");
+    }, 250);
 }
 
 function updateHud(ts, size) {
@@ -1850,6 +2058,8 @@ function runBenchmark() {
     }
 
     function rafLoop(ts) {
+        if (state.phase === "complete" || state.phase === "error")
+            return;
         try {
             const size = renderFrame(ts);
             if (updateMeasurement(ts, size))
@@ -1862,6 +2072,8 @@ function runBenchmark() {
     }
 
     function burstLoop() {
+        if (state.phase === "complete" || state.phase === "error")
+            return;
         try {
             const deadline = performance.now() + burstChunkMs;
             let size = state.lastSize || resizeCanvas();
@@ -1901,8 +2113,11 @@ try {
     window.addEventListener("beforeunload", () => releaseWebGlContext("beforeunload"));
     canvas.addEventListener("webglcontextlost", event => {
         event.preventDefault();
-        emitEvent("webgl-context-lost", { phase: state.phase });
+        const phase = state.phase;
+        emitEvent("webgl-context-lost", { phase, intentional: state.contextReleased });
         setMetric("phase", "context lost", "warn");
+        if (!state.contextReleased && !state.terminalResultPosted)
+            failBenchmark(new Error(`unexpected WebGL context loss during ${phase}`), "webglcontextlost");
     }, false);
     if (startDelayMs > 0) {
         setMetric("phase", "start delay");

@@ -19,6 +19,10 @@ func ownerName(_ window: [String: Any]) -> String {
     return window[kCGWindowOwnerName as String] as? String ?? ""
 }
 
+func ownerPid(_ window: [String: Any]) -> Int? {
+    return window[kCGWindowOwnerPID as String] as? Int
+}
+
 func title(_ window: [String: Any]) -> String {
     return window[kCGWindowName as String] as? String ?? ""
 }
@@ -34,10 +38,11 @@ func area(_ window: [String: Any]) -> CGFloat {
     return width * height
 }
 
-func findBrowserWindow(appName: String, runId: String) -> Int? {
+func findBrowserWindow(appName: String, runId: String, processId: Int?) -> Int? {
     let candidates = windowList().compactMap { window -> (number: Int, layer: Int, area: CGFloat)? in
         let owner = ownerName(window)
         guard owner == appName || owner.contains(appName) else { return nil }
+        if let processId, ownerPid(window) != processId { return nil }
 
         let windowTitle = title(window)
         guard windowTitle.contains("DXMTBench") else { return nil }
@@ -69,7 +74,7 @@ func findVirtualBoxWindow(vmName: String) -> Int? {
 
 let args = Array(CommandLine.arguments.dropFirst())
 guard let commandName = args.first, let command = Command(rawValue: commandName) else {
-    fputs("usage: macos-window-id.swift browser <app-name> [run-id] | vm [vm-name]\n", stderr)
+    fputs("usage: macos-window-id.swift browser <app-name> [run-id] [owner-pid] | vm [vm-name]\n", stderr)
     exit(64)
 }
 
@@ -78,7 +83,8 @@ switch command {
 case .browser:
     let appName = args.count > 1 ? args[1] : "Google Chrome"
     let runId = args.count > 2 ? args[2] : ""
-    result = findBrowserWindow(appName: appName, runId: runId)
+    let processId = args.count > 3 ? Int(args[3]) : nil
+    result = findBrowserWindow(appName: appName, runId: runId, processId: processId)
 case .vm:
     let vmName = args.count > 1 ? args[1] : ""
     result = findVirtualBoxWindow(vmName: vmName)

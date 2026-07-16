@@ -32,7 +32,13 @@ fi
 
 duration="${DURATION:-45}"
 warmup="${WARMUP:-5}"
-start_delay_ms="${START_DELAY_MS:-0}"
+if [[ -n "${START_DELAY_MS:-}" ]]; then
+    start_delay_ms="$START_DELAY_MS"
+elif [[ "$target" == "vm" ]]; then
+    start_delay_ms="3000"
+else
+    start_delay_ms="0"
+fi
 instances="${INSTANCES:-512}"
 dpr="${DPR:-auto}"
 workload="${WORKLOAD:-cubes-fill}"
@@ -50,7 +56,7 @@ fps_regression_pct="${FPS_REGRESSION_PCT:-7}"
 frame_ms_regression_pct="${FRAME_MS_REGRESSION_PCT:-15}"
 cpu_regression_pct="${CPU_REGRESSION_PCT:-25}"
 stop_on_alert="${STOP_ON_ALERT:-0}"
-fail_on_alert="${FAIL_ON_ALERT:-0}"
+fail_on_alert="${FAIL_ON_ALERT:-1}"
 shader_iters="${SHADER_ITERS:-64}"
 texture_size="${TEXTURE_SIZE:-1024}"
 vertices="${VERTICES:-262144}"
@@ -66,14 +72,23 @@ guest_browser_maximize="${GUEST_BROWSER_MAXIMIZE:-1}"
 if [[ -n "${LAUNCH_METHOD:-}" ]]; then
     launch_method="$LAUNCH_METHOD"
 elif [[ "$target" == "vm" ]]; then
-    launch_method="keyboard"
+    launch_method="run"
 else
     launch_method="browser"
 fi
 guest_browser_exe="${GUEST_BROWSER_EXE:-msedge}"
+guest_browser_process="${GUEST_BROWSER_PROCESS:-msedge.exe}"
 guest_browser_profile="${GUEST_BROWSER_PROFILE:-}"
+guest_browser_profile_owned="0"
+guest_browser_startup_seconds="${GUEST_BROWSER_STARTUP_SECONDS:-5}"
 guest_browser_flags="${GUEST_BROWSER_FLAGS:---no-first-run --start-maximized --disable-direct-composition --disable-features=DirectCompositionSwapChain,UseDirectCompositionVideoOverlays}"
-guest_kill_browser_before_run="${GUEST_KILL_BROWSER_BEFORE_RUN:-0}"
+if [[ -n "${GUEST_KILL_BROWSER_BEFORE_RUN:-}" ]]; then
+    guest_kill_browser_before_run="$GUEST_KILL_BROWSER_BEFORE_RUN"
+elif [[ "$target" == "vm" && "$launch_method" == "run" ]]; then
+    guest_kill_browser_before_run="1"
+else
+    guest_kill_browser_before_run="0"
+fi
 local_browser="${LOCAL_BROWSER:-chrome}"
 local_browser_app="${LOCAL_BROWSER_APP:-Google Chrome}"
 local_browser_process_pattern="${LOCAL_BROWSER_PROCESS_PATTERN:-Google Chrome}"
@@ -85,9 +100,19 @@ virtualbox_src="${VIRTUALBOX_SRC:-}"
 allow_hazardous="${ALLOW_HAZARDOUS:-0}"
 allow_heavy="${ALLOW_HEAVY:-0}"
 max_canvas_pixels="${MAX_CANVAS_PIXELS:-4200000}"
-release_context="${RELEASE_CONTEXT:-1}"
+expected_canvas_width="${EXPECTED_CANVAS_WIDTH:-0}"
+expected_canvas_height="${EXPECTED_CANVAS_HEIGHT:-0}"
 midrun_screenshot="${MIDRUN_SCREENSHOT:-1}"
 midrun_screenshot_delay="${MIDRUN_SCREENSHOT_DELAY:-}"
+if [[ -n "${RELEASE_CONTEXT:-}" ]]; then
+    release_context="$RELEASE_CONTEXT"
+elif [[ "$midrun_screenshot" == "1" ]]; then
+    # A Retina host-window capture can finish after a short measurement.  Retain
+    # the final scene until the runner has durable host and guest visual evidence.
+    release_context="0"
+else
+    release_context="1"
+fi
 visual_analysis="${VISUAL_ANALYSIS:-1}"
 host_window_screenshot="${HOST_WINDOW_SCREENSHOT:-1}"
 focus_screenshot_window="${FOCUS_SCREENSHOT_WINDOW:-1}"
@@ -97,6 +122,8 @@ elif [[ "$target" == "local" && "$local_browser_isolated" == "1" ]]; then
     cleanup_browser="1"
 elif [[ "$target" == "local" ]]; then
     cleanup_browser="0"
+elif [[ "$launch_method" == "run" ]]; then
+    cleanup_browser="1"
 else
     cleanup_browser="0"
 fi
@@ -112,7 +139,8 @@ show_desktop_after_run="${SHOW_DESKTOP_AFTER_RUN:-0}"
 fail_on_graphics_alert="${FAIL_ON_GRAPHICS_ALERT:-1}"
 run_start_unix="$(date +%s)"
 outroot="${OUTROOT:-$script_dir/dxmtbench-runs}"
-outdir="${OUTDIR:-$outroot/$(date +%Y%m%d-%H%M%S)}"
+run_stamp="$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
+outdir="${OUTDIR:-$outroot/$run_stamp}"
 html="$script_dir/dxmtbench.html"
 server_py="$script_dir/dxmtbench-server.py"
 bench_py="$script_dir/dxmtbench.py"
@@ -162,6 +190,21 @@ check_hazardous_config() {
 
 check_hazardous_config
 
+if ! [[ "$expected_canvas_width" =~ ^(0|[1-9][0-9]*)$ ]] \
+    || ! [[ "$expected_canvas_height" =~ ^(0|[1-9][0-9]*)$ ]]
+then
+    printf 'EXPECTED_CANVAS_WIDTH and EXPECTED_CANVAS_HEIGHT must be nonnegative decimal integers.\n' >&2
+    exit 64
+fi
+
+if [[ "$target" == "vm" && "$browser_fullscreen" == "1" ]] \
+    && { ! [[ "$expected_canvas_width" =~ ^[1-9][0-9]*$ ]] \
+        || ! [[ "$expected_canvas_height" =~ ^[1-9][0-9]*$ ]]; }
+then
+    printf 'BROWSER_FULLSCREEN=1 requires nonzero EXPECTED_CANVAS_WIDTH and EXPECTED_CANVAS_HEIGHT so fullscreen is verified.\n' >&2
+    exit 64
+fi
+
 reset_vm_for_suite_workload() {
     [[ "$target" == "vm" ]] || return 0
     python3 "$bench_py" reset-vm "$vboxmanage" "$vm" "$suite_reset_settle_seconds"
@@ -196,7 +239,7 @@ if [[ -n "$suite" && "${RUN_ONE:-0}" != "1" ]]; then
             ;;
     esac
 
-    suite_root="${OUTDIR:-$outroot/$(date +%Y%m%d-%H%M%S)-suite}"
+    suite_root="${OUTDIR:-$outroot/${run_stamp}-suite}"
     mkdir -p "$suite_root"
     suite_port_selected=""
     suite_server_pid=""
@@ -226,7 +269,7 @@ if [[ -n "$suite" && "${RUN_ONE:-0}" != "1" ]]; then
     suite_alerts="$suite_root/suite-alerts.jsonl"
     suite_latest="$suite_root/suite-latest.json"
     suite_status="$suite_root/suite-status.txt"
-    printf 'workload\tstatus\tmode\tsync_every\tfps_avg\tframe_ms_p95\tgpu_timer_usable\tgpu_ms_p95\tgpu_samples\tactive_cpu_avg\tcanvas\tdraws_per_frame\tvertices_per_frame\ttriangles_per_frame\tpixels_per_frame\tstencil_pixels_per_frame\ttexture_samples_per_frame\tfb_binds_per_frame\tstate_changes_per_frame\testimated_mib_per_second\tfb_write_mib_per_second\ttexture_mib_per_second\tclear_mib_per_second\trender_target_mib_per_second\tstencil_mib_per_second\tupload_mib_per_second\toutdir\n' > "$suite_tsv"
+    python3 "$bench_py" suite-header > "$suite_tsv"
     : > "$suite_jsonl"
     : > "$suite_events"
     : > "$suite_alerts"
@@ -302,7 +345,7 @@ if [[ -n "$suite" && "${RUN_ONE:-0}" != "1" ]]; then
 
     alerts_count="$(wc -l < "$suite_alerts" | tr -d ' ')"
     results_count="$(wc -l < "$suite_jsonl" | tr -d ' ')"
-    python3 "$bench_py" suite-complete "$suite_events" "$suite_latest" "$suite_status" "$suite_root" "$results_count" "$alerts_count"
+    python3 "$bench_py" suite-complete "$suite_events" "$suite_latest" "$suite_status" "$suite_root" "$results_count" "$alerts_count" "$total_items"
     case "$suite_print" in
         quiet) ;;
         table)
@@ -313,9 +356,13 @@ if [[ -n "$suite" && "${RUN_ONE:-0}" != "1" ]]; then
             printf 'suite_event=%s\n' "$(cat "$suite_latest")"
             ;;
         *)
-            printf 'suite_complete results=%s alerts=%s root=%s\n' "$results_count" "$alerts_count" "$suite_root"
+            printf 'suite_complete results=%s expected=%s alerts=%s root=%s\n' "$results_count" "$total_items" "$alerts_count" "$suite_root"
             ;;
     esac
+    if [[ "$results_count" != "$total_items" ]]; then
+        printf 'suite_incomplete results=%s expected=%s root=%s\n' "$results_count" "$total_items" "$suite_root" >&2
+        exit 4
+    fi
     if [[ "$fail_on_alert" == "1" && "$alerts_count" != "0" ]]; then
         exit 3
     fi
@@ -328,16 +375,66 @@ pid_for_vm() {
     pgrep -nf '/VirtualBoxVM.app/.*/VirtualBoxVM .*--startvm' || true
 }
 
+macos_window_id_bin=""
+
+prepare_macos_window_id_helper() {
+    [[ "$(uname -s)" == "Darwin" ]] || return 0
+    command -v xcrun >/dev/null 2>&1 || return 0
+    [[ -f "$macos_window_id_swift" ]] || return 0
+
+    local cache_root source_hash cache_bin cache_tmp
+    if [[ -n "${TMPDIR:-}" ]]; then
+        cache_root="${TMPDIR%/}/dxmtbench-window-id-cache"
+        mkdir -p "$cache_root" || return 0
+        chmod 700 "$cache_root" || return 0
+        [[ -O "$cache_root" ]] || return 0
+    else
+        cache_root="$(mktemp -d /tmp/dxmtbench-window-id.XXXXXX)" || return 0
+    fi
+    source_hash="$({
+        shasum -a 256 "$macos_window_id_swift" 2>/dev/null
+        uname -m
+        xcrun swiftc --version 2>/dev/null
+    } | shasum -a 256 | awk '{print substr($1, 1, 20)}')" || return 0
+    [[ -n "$source_hash" ]] || return 0
+    cache_bin="$cache_root/macos-window-id-${source_hash}"
+    if [[ ! -x "$cache_bin" ]]; then
+        cache_tmp="${cache_bin}.$$"
+        if xcrun swiftc -O "$macos_window_id_swift" -o "$cache_tmp" >"$outdir/macos-window-id-build.log" 2>&1; then
+            if ! chmod +x "$cache_tmp" || ! mv "$cache_tmp" "$cache_bin"; then
+                rm -f "$cache_tmp"
+                return 0
+            fi
+        else
+            rm -f "$cache_tmp"
+        fi
+    fi
+    if [[ -x "$cache_bin" ]]; then
+        macos_window_id_bin="$cache_bin"
+        printf 'macos_window_id_helper=%s\n' "$cache_bin" >> "$outdir/run-config.txt"
+    fi
+}
+
 macos_window_id() {
     [[ "$(uname -s)" == "Darwin" ]] || return 0
-    command -v swift >/dev/null 2>&1 || return 0
     [[ -f "$macos_window_id_swift" ]] || return 0
+    if [[ -x "$macos_window_id_bin" ]]; then
+        if "$macos_window_id_bin" "$@" 2>/dev/null; then
+            return 0
+        fi
+        macos_window_id_bin=""
+    fi
+    command -v swift >/dev/null 2>&1 || return 0
     swift "$macos_window_id_swift" "$@" 2>/dev/null || true
 }
 
 browser_window_id() {
     [[ "$target" == "local" ]] || return 0
-    macos_window_id browser "$local_browser_app" "$run_id"
+    if [[ -n "${local_browser_pid:-}" ]]; then
+        macos_window_id browser "$local_browser_app" "" "$local_browser_pid"
+    else
+        macos_window_id browser "$local_browser_app" "${run_id:0:24}"
+    fi
 }
 
 vm_window_id() {
@@ -489,16 +586,15 @@ OSA
     else
         open -a "$local_browser_app" "$url" >"$outdir/local-browser.stdout" 2>"$outdir/local-browser.stderr"
     fi
-    sleep 2
+    sleep 0.25
     after_pids="$(pgrep -f "$local_browser_process_pattern" 2>/dev/null | sort -n | paste -sd, - || true)"
     newest_pid="$(pgrep -nf "$local_browser_process_pattern" 2>/dev/null || true)"
     printf 'local_browser_pids_before=%s\n' "$before_pids" >> "$outdir/run-config.txt"
     printf 'local_browser_pids_after=%s\n' "$after_pids" >> "$outdir/run-config.txt"
     printf 'local_browser_newest_pid=%s\n' "$newest_pid" >> "$outdir/run-config.txt"
-    if [[ -n "${local_browser_pid:-$newest_pid}" ]]; then
-        printf '%s\n' "${local_browser_pid:-$newest_pid}" > "$outdir/local-browser.pid"
+    if [[ -n "${local_browser_pid:-}" ]]; then
+        printf '%s\n' "$local_browser_pid" > "$outdir/local-browser.pid"
     fi
-    sleep 2
 }
 
 local_cleanup_after_run() {
@@ -518,6 +614,18 @@ key_scancodes() {
     "$vboxmanage" controlvm "$vm" keyboardputscancode "$@" >/dev/null 2>&1 || true
 }
 
+run_guest_dialog_command() {
+    local command="$1"
+    key_scancodes 01 81
+    sleep 0.2
+    key_scancodes e0 5b 13 93 e0 db
+    sleep 0.8
+    "$vboxmanage" controlvm "$vm" keyboardputstring "$command" >/dev/null 2>&1 || true
+    sleep 0.2
+    key_scancodes 1c 9c
+    sleep 0.8
+}
+
 maximize_guest_browser_window() {
     [[ "$guest_browser_maximize" == "1" ]] || return 0
     [[ "$browser_fullscreen" == "1" ]] && return 0
@@ -530,39 +638,49 @@ maximize_guest_browser_window() {
     sleep 0.8
 }
 
+configure_guest_browser_window() {
+    maximize_guest_browser_window
+    if [[ "$browser_fullscreen" == "1" ]]; then
+        key_scancodes 57 d7
+        sleep 0.8
+    fi
+    guest_browser_window_configured="1"
+}
+
 open_url_in_guest() {
     local url="$1"
     local mode="${2:-$launch_method}"
-    key_scancodes 01 81
-    sleep 0.3
     if [[ "$mode" == "run" ]]; then
         local command
-        command="cmd /c start \"\" $guest_browser_exe --user-data-dir=\"$guest_browser_profile\" $guest_browser_flags --new-window \"$url\""
-        key_scancodes e0 5b 13 93 e0 db
-        sleep 0.8
-        "$vboxmanage" controlvm "$vm" keyboardputstring "$command" >/dev/null 2>&1 || true
-    elif [[ "$mode" == "browser" ]]; then
+        command="cmd /c start \"\" $guest_browser_exe --user-data-dir=\"$guest_browser_profile\" $guest_browser_flags --new-window"
+        run_guest_dialog_command "$command"
+        sleep "$guest_browser_startup_seconds"
         key_scancodes 1d 26 a6 9d
         sleep 0.3
         "$vboxmanage" controlvm "$vm" keyboardputstring "$url" >/dev/null 2>&1 || true
-    else
+        sleep 0.2
+        key_scancodes 1c 9c
+    elif [[ "$mode" == "browser" ]]; then
+        key_scancodes 01 81
+        sleep 0.3
+        key_scancodes 1d 26 a6 9d
+        sleep 0.3
+        "$vboxmanage" controlvm "$vm" keyboardputstring "$url" >/dev/null 2>&1 || true
+        sleep 0.2
+        key_scancodes 1c 9c
+    elif [[ "$mode" == "clipboard" ]]; then
+        key_scancodes 01 81
+        sleep 0.2
         key_scancodes e0 5b 13 93 e0 db
-        sleep 1.0
-    fi
-    if [[ "$mode" == "clipboard" ]]; then
+        sleep 0.8
         printf '%s' "$url" | pbcopy
         "$vboxmanage" controlvm "$vm" clipboard mode bidirectional >/dev/null 2>&1 || true
         sleep 0.5
         key_scancodes 1d 2f af 9d
-    elif [[ "$mode" == "keyboard" ]]; then
-        "$vboxmanage" controlvm "$vm" keyboardputstring "$url" >/dev/null 2>&1 || true
-    fi
-    sleep 0.3
-    key_scancodes 1c 9c
-    sleep 5.0
-    maximize_guest_browser_window
-    if [[ "$browser_fullscreen" == "1" ]]; then
-        key_scancodes 57 d7
+        sleep 0.2
+        key_scancodes 1c 9c
+    else
+        run_guest_dialog_command "$url"
     fi
 }
 
@@ -572,7 +690,10 @@ wait_for_event() {
     local file="$outdir/browser-events.jsonl"
     local deadline=$((SECONDS + timeout_seconds))
     while (( SECONDS < deadline )); do
-        if [[ -s "$file" ]] && rg -q "\"event\": \"$event\"" "$file"; then
+        if [[ -s "$file" ]] \
+            && rg "\"event\": \"$event\"" "$file" \
+                | rg -q "\"runId\": \"$run_id\""
+        then
             return 0
         fi
         sleep 1
@@ -583,19 +704,28 @@ wait_for_event() {
 guest_cleanup_after_run() {
     [[ "$cleanup_browser" == "1" ]] || return 0
 
-    if [[ "$exit_browser_fullscreen" == "1" && "$browser_fullscreen" == "1" ]]; then
+    if [[ "$exit_browser_fullscreen" == "1" && "$browser_fullscreen" == "1" \
+        && "${guest_browser_window_configured:-0}" == "1" ]]; then
         key_scancodes 57 d7
         sleep 0.5
     fi
 
-    key_scancodes 01 81
-    sleep 0.2
-    key_scancodes 1d 26 a6 9d
-    sleep 0.2
-    "$vboxmanage" controlvm "$vm" keyboardputstring "about:blank" >/dev/null 2>&1 || true
-    sleep 0.2
-    key_scancodes 1c 9c
-    sleep 0.8
+    if [[ "$launch_method" == "run" ]]; then
+        local cleanup_command="cmd /c taskkill /IM $guest_browser_process /F >NUL 2>&1"
+        if [[ "$guest_browser_profile_owned" == "1" ]]; then
+            cleanup_command="$cleanup_command & rmdir /S /Q \"$guest_browser_profile\""
+        fi
+        run_guest_dialog_command "$cleanup_command"
+    else
+        key_scancodes 01 81
+        sleep 0.2
+        key_scancodes 1d 26 a6 9d
+        sleep 0.2
+        "$vboxmanage" controlvm "$vm" keyboardputstring "about:blank" >/dev/null 2>&1 || true
+        sleep 0.2
+        key_scancodes 1c 9c
+        sleep 0.8
+    fi
 
     if [[ "$show_desktop_after_run" == "1" ]]; then
         key_scancodes e0 5b 20 a0 e0 db
@@ -669,9 +799,10 @@ elif [[ "$target" == "local" ]]; then
 else
     url_host="10.0.2.2"
 fi
-run_id="$(date +%Y%m%d-%H%M%S)"
+run_id="$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 if [[ -z "$guest_browser_profile" ]]; then
     guest_browser_profile="%TEMP%\\dxmtbench-$run_id"
+    guest_browser_profile_owned="1"
 fi
 host_cpus="$(sysctl -n hw.ncpu 2>/dev/null || true)"
 host_memory_mb="$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f", $1 / 1048576}' || true)"
@@ -681,6 +812,7 @@ vm_memory_mb=""
 vm_vram_mb=""
 vm_graphics=""
 vm_3d=""
+vm_video_mode=""
 vm_log_file=""
 vm_log_start_line="0"
 if [[ "$target" == "vm" ]]; then
@@ -690,6 +822,7 @@ if [[ "$target" == "vm" ]]; then
     vm_vram_mb="$(printf '%s\n' "$vm_info_mr" | awk -F= '$1=="vram"{gsub(/"/,"",$2); print $2; exit}')"
     vm_graphics="$(printf '%s\n' "$vm_info_mr" | awk -F= '$1=="graphicscontroller"{gsub(/"/,"",$2); print $2; exit}')"
     vm_3d="$(printf '%s\n' "$vm_info_mr" | awk -F= '$1=="accelerate3d"{gsub(/"/,"",$2); print $2; exit}')"
+    vm_video_mode="$(printf '%s\n' "$vm_info_mr" | awk -F= '$1=="VideoMode"{gsub(/"/,"",$2); print $2; exit}')"
     capture_graphics_log_start
 fi
 bench_config_file="$outdir/bench-config.json"
@@ -715,6 +848,8 @@ python3 "$bench_py" write-config "$bench_config_file" \
     finish "$finish_each_frame" \
     syncEvery "$sync_every" \
     maxCanvasPixels "$max_canvas_pixels" \
+    expectedCanvasWidth "$expected_canvas_width" \
+    expectedCanvasHeight "$expected_canvas_height" \
     releaseContext "$release_context" \
     hostCpus "$host_cpus" \
     hostMemoryMb "$host_memory_mb" \
@@ -723,13 +858,14 @@ python3 "$bench_py" write-config "$bench_config_file" \
     vmMemoryMb "$vm_memory_mb" \
     vmVramMb "$vm_vram_mb" \
     vmGraphics "$vm_graphics" \
-    vm3d "$vm_3d"
+    vm3d "$vm_3d" \
+    vmVideoMode "$vm_video_mode"
 if [[ "$server_config_file" != "$bench_config_file" ]]; then
     server_config_tmp="${server_config_file}.tmp.$$"
     cp "$bench_config_file" "$server_config_tmp"
     mv "$server_config_tmp" "$server_config_file"
 fi
-url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
+url="http://${url_host}:${port}/bench.html?run=${run_id}"
 
 {
     printf 'target=%s\n' "$target"
@@ -760,6 +896,8 @@ url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
     printf 'allow_hazardous=%s\n' "$allow_hazardous"
     printf 'allow_heavy=%s\n' "$allow_heavy"
     printf 'max_canvas_pixels=%s\n' "$max_canvas_pixels"
+    printf 'expected_canvas_width=%s\n' "$expected_canvas_width"
+    printf 'expected_canvas_height=%s\n' "$expected_canvas_height"
     printf 'release_context=%s\n' "$release_context"
     printf 'midrun_screenshot=%s\n' "$midrun_screenshot"
     printf 'midrun_screenshot_delay=%s\n' "$midrun_screenshot_delay"
@@ -779,11 +917,15 @@ url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
     printf 'vm_vram_mb=%s\n' "$vm_vram_mb"
     printf 'vm_graphics=%s\n' "$vm_graphics"
     printf 'vm_3d=%s\n' "$vm_3d"
+    printf 'vm_video_mode=%s\n' "$vm_video_mode"
     printf 'browser_fullscreen=%s\n' "$browser_fullscreen"
     printf 'guest_browser_maximize=%s\n' "$guest_browser_maximize"
     printf 'launch_method=%s\n' "$launch_method"
     printf 'guest_browser_exe=%s\n' "$guest_browser_exe"
+    printf 'guest_browser_process=%s\n' "$guest_browser_process"
     printf 'guest_browser_profile=%s\n' "$guest_browser_profile"
+    printf 'guest_browser_profile_owned=%s\n' "$guest_browser_profile_owned"
+    printf 'guest_browser_startup_seconds=%s\n' "$guest_browser_startup_seconds"
     printf 'guest_browser_flags=%s\n' "$guest_browser_flags"
     printf 'guest_kill_browser_before_run=%s\n' "$guest_kill_browser_before_run"
     printf 'local_browser=%s\n' "$local_browser"
@@ -813,6 +955,8 @@ url="http://${url_host}:${port}/bench.html?run=${run_id}&cfg=1"
         git -C "$virtualbox_src" rev-parse --short HEAD 2>/dev/null | sed 's/^/virtualbox.git=/'
     fi
 } > "$outdir/host-info.txt"
+
+prepare_macos_window_id_helper || true
 
 capture_crash_diagnostics() {
     local reason="$1"
@@ -882,14 +1026,37 @@ if [[ "$target" == "vm" ]]; then
 fi
 
 server_pid=""
+browser_launched="0"
+browser_cleanup_done="0"
+guest_browser_window_configured="0"
+
+cleanup_browser_after_run() {
+    [[ "$browser_launched" == "1" && "$browser_cleanup_done" == "0" ]] || return 0
+    browser_cleanup_done="1"
+    if [[ "$target" == "vm" ]]; then
+        guest_cleanup_after_run
+    else
+        local_cleanup_after_run
+    fi
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM HUP
+    cleanup_browser_after_run || true
+    if [[ -n "$server_pid" ]]; then
+        kill "$server_pid" >/dev/null 2>&1 || true
+    fi
+    exit "$rc"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT HUP
+trap 'exit 143' TERM
+
 if [[ "$external_server" != "1" ]]; then
     python3 "$server_py" --bind "$server_bind" --port "$port" --root "$script_dir" --html "$html" --outdir "$outdir" --config "$server_config_file" >"$outdir/server.stdout" 2>"$outdir/server.stderr" &
     server_pid=$!
-    cleanup() {
-        kill "$server_pid" >/dev/null 2>&1 || true
-    }
-    trap cleanup EXIT
-
     for _ in {1..20}; do
         [[ -s "$outdir/server-ready.txt" ]] && break
         sleep 0.25
@@ -900,28 +1067,35 @@ if [[ "$target" == "vm" ]]; then
     "$vboxmanage" controlvm "$vm" screenshotpng "$outdir/before.png" >/dev/null 2>&1 || true
     capture_host_window_screenshot "$outdir/host-before.png"
     if [[ "$guest_kill_browser_before_run" == "1" ]]; then
-        open_url_in_guest "cmd /c taskkill /IM msedge.exe /F >NUL 2>&1" "keyboard"
+        open_url_in_guest "cmd /c taskkill /IM $guest_browser_process /F >NUL 2>&1" "keyboard"
         sleep 1
     fi
+    browser_launched="1"
     open_url_in_guest "$url"
 else
+    browser_launched="1"
     open_url_in_local_browser "$url"
     capture_run_screenshot "$outdir/before.png"
     pid="$(cat "$outdir/local-browser.pid" 2>/dev/null || true)"
     printf 'pid=%s\n' "$pid" | tee -a "$outdir/run-config.txt"
 fi
 
-if ! wait_for_event "script-start" 10; then
+if ! wait_for_event "script-start" 15; then
+    echo "script-start event for run $run_id not observed; refusing an ambiguous retry" | tee -a "$outdir/summary.txt"
     if [[ "$target" == "vm" ]]; then
-        retry_method="browser"
-        if [[ "$launch_method" == "browser" ]]; then
-            retry_method="keyboard"
-        fi
-        echo "script-start event not observed after initial launch; retrying through $retry_method launch" | tee -a "$outdir/summary.txt"
-        open_url_in_guest "$url" "$retry_method"
+        capture_crash_diagnostics "script-start-timeout"
+        capture_run_screenshot "$outdir/no-script-start.png"
+        capture_host_window_screenshot "$outdir/host-no-script-start.png"
     else
-        echo "script-start event not observed after local browser launch" | tee -a "$outdir/summary.txt"
+        screencapture -x "$outdir/no-script-start.png" >/dev/null 2>&1 || true
     fi
+    analyze_visuals
+    cat "$outdir/visual-summary.txt" >> "$outdir/summary.txt" 2>/dev/null || true
+    exit 2
+fi
+
+if [[ "$target" == "vm" ]]; then
+    configure_guest_browser_window
 fi
 
 if ! wait_for_event "measure-start" 45; then
@@ -947,12 +1121,15 @@ fi
 midrun_screenshot_pid=""
 if [[ "$midrun_screenshot" == "1" ]]; then
     if [[ -z "$midrun_screenshot_delay" ]]; then
-        midrun_screenshot_delay=1
+        midrun_screenshot_delay=0
     fi
     (
         sleep "$midrun_screenshot_delay"
-        capture_run_screenshot "$outdir/measure-mid.png"
+        # Capture the user-visible host window before VBoxManage requests the guest
+        # framebuffer.  Launching both captures at once lets screenshotpng win the
+        # display lock, which can postpone the primary host image past context release.
         capture_host_window_screenshot "$outdir/host-measure-mid.png"
+        capture_run_screenshot "$outdir/measure-mid.png"
     ) &
     midrun_screenshot_pid=$!
 fi
@@ -1009,11 +1186,12 @@ fi
 graphics_alert_rc=0
 if [[ "$target" == "vm" ]]; then
     scan_graphics_log_delta || graphics_alert_rc=$?
-    guest_cleanup_after_run
-else
-    local_cleanup_after_run
 fi
+cleanup_browser_after_run
 analyze_visuals
+functional_validation_rc=0
+python3 "$bench_py" validate-run "$outdir" "$visual_analysis" > "$outdir/functional-validation.txt" 2>&1 \
+    || functional_validation_rc=$?
 
 {
     printf 'outdir=%s\n' "$outdir"
@@ -1037,10 +1215,16 @@ analyze_visuals
     if [[ -s "$outdir/visual-summary.txt" ]]; then
         cat "$outdir/visual-summary.txt"
     fi
+    if [[ -s "$outdir/functional-validation.txt" ]]; then
+        cat "$outdir/functional-validation.txt"
+    fi
 } | tee -a "$outdir/summary.txt"
 
 echo "$outdir"
 
+if [[ "$functional_validation_rc" != "0" ]]; then
+    exit "$functional_validation_rc"
+fi
 if [[ "$graphics_alert_rc" != "0" && "$fail_on_graphics_alert" == "1" ]]; then
     exit "$graphics_alert_rc"
 fi
